@@ -172,13 +172,15 @@ and change the parameters such as number of objects per episode in the correspon
 ## Citation
 If you use this code in your research, please cite our paper:
 ```
-@misc{busch2024mapallrealtimeopenvocabulary,
+@INPROCEEDINGS{11128393,
+      author={Busch, Finn Lukas and Homberger, Timon and Ortega-Peimbert, Jesús and Yang, Quantao and Andersson, Olov},
+      booktitle={2025 IEEE International Conference on Robotics and Automation (ICRA)}, 
       title={One Map to Find Them All: Real-time Open-Vocabulary Mapping for Zero-shot Multi-Object Navigation}, 
-      author={Finn Lukas Busch and Timon Homberger and Jesús Ortega-Peimbert and Quantao Yang and Olov Andersson},
-      year={2024},
-      eprint={2409.11764},
-      archivePrefix={arXiv},
-      primaryClass={cs.RO},
-      url={https://arxiv.org/abs/2409.11764}, 
+      year={2025},
+      volume={},
+      number={},
+      pages={14835-14842},
+      keywords={Training;Three-dimensional displays;Uncertainty;Navigation;Semantics;Benchmark testing;Search problems;Probabilistic logic;Real-time systems;Videos},
+      doi={10.1109/ICRA55743.2025.11128393},
 }
 ```
