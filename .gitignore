@@ -1,0 +1,52 @@
+# 데이터셋 폴더 (41GB - 제외!)
+datasets/
+
+# ignore all .pngs
+*.png
+
+weights/*
+
+# Pycache
+**__pycache__**
+
+results*/
+
+*.pt
+
+yolov7
+
+# Python 관련
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 가상환경
+venv/
+env/
+ENV/
+
+# IDE 관련
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 로그 파일
+*.log
+
+# 임시 파일
+.DS_Store
+Thumbs.db
+*.tmp
+
+# 결과 파일
+*.rrd
+
+# 캐시
+.cache/
