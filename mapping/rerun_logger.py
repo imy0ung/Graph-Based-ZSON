@@ -32,7 +32,11 @@ def setup_blueprint_debug():
                 rrb.Spatial2DView(origin="map",
                                   name="Traversable",
                                   contents=["$origin/traversable",
-                                            "$origin/position"], ),
+                                            "$origin/position",
+                                            "$origin/pose_graph/nodes",
+                                            "$origin/pose_graph/edges/odometry",
+                                            "$origin/pose_graph/edges/loop_closure",
+                                            "$origin/pose_graph/orientations"], ),
             ),
             rrb.Vertical(
                 rrb.Tabs(
@@ -43,19 +47,31 @@ def setup_blueprint_debug():
                                          "$origin/proj_detect",
                                          "$origin/frontiers",
                                          "$origin/frontiers_far",
-                                         "$origin/position"]),
+                                         "$origin/position",
+                                         "$origin/pose_graph/nodes",
+                                         "$origin/pose_graph/edges/odometry",
+                                         "$origin/pose_graph/edges/loop_closure",
+                                        ]),
                       rrb.Spatial2DView(origin="map",
                                         name="SimilarityTresholded",
                                         contents=
                                         ["$origin/similarity_th/",
                                          "$origin/proj_detect",
-                                         "$origin/position"]),
+                                         "$origin/position",
+                                         "$origin/pose_graph/nodes",
+                                         "$origin/pose_graph/edges/odometry",
+                                         "$origin/pose_graph/edges/loop_closure",
+                                        ]),
                       rrb.Spatial2DView(origin="map",
                                         name="SimilarityTresholdedCl",
                                         contents=
                                         ["$origin/similarity_th2/",
                                          "$origin/proj_detect",
-                                         "$origin/position"]),
+                                         "$origin/position",
+                                         "$origin/pose_graph/nodes",
+                                         "$origin/pose_graph/edges/odometry",
+                                         "$origin/pose_graph/edges/loop_closure",
+                                        ]),
                       ],
                 ),
                 rrb.Tabs(
@@ -71,20 +87,32 @@ def setup_blueprint_debug():
                                                 "$origin/path_simplified",
                                                 "$origin/ground_truth",
                                                 "$origin/frontiers",
-                                                "$origin/frontiers_far", ]),
+                                                "$origin/frontiers_far",
+                                                "$origin/pose_graph/nodes",
+                                                "$origin/pose_graph/edges/odometry",
+                                                "$origin/pose_graph/edges/loop_closure",
+ ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Scores",
                                       contents=["$origin/scores",
                                                 "$origin/position",
                                                 "$origin/goal_pos",
-                                                "$origin/path"]),
+                                                "$origin/path",
+                                                "$origin/pose_graph/nodes",
+                                                "$origin/pose_graph/edges/odometry",
+                                                "$origin/pose_graph/edges/loop_closure",
+                                               ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Unexplored",
                                       contents=["$origin/frontiers",
                                                 "$origin/frontiers_far",
                                                 "$origin/largest_contour",
                                                 "$origin/position",
-                                                "$origin/unexplored"]),
+                                                "$origin/unexplored",
+                                                "$origin/pose_graph/nodes",
+                                                "$origin/pose_graph/edges/odometry",
+                                                "$origin/pose_graph/edges/loop_closure",
+                                               ]),
                 ),
             ),
         ),
@@ -151,6 +179,15 @@ def setup_blueprint_debug():
     rr.log("map/frontiers_far", rr.Transform3D(translation=np.array([0, 600, 0]),
                                                rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                              angle=rr.datatypes.Angle(rad=-np.pi))))
+    for pose_path in [
+        "map/pose_graph/nodes",
+        "map/pose_graph/edges/odometry",
+        "map/pose_graph/edges/loop_closure",
+    ]:
+        rr.log(pose_path,
+               rr.Transform3D(translation=np.array([0, 600, 0]),
+                              rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
+                                                            angle=rr.datatypes.Angle(rad=-np.pi))))
 
 def setup_blueprint():
     my_blueprint = rrb.Blueprint(
@@ -168,7 +205,11 @@ def setup_blueprint():
                                         name="Similarity",
                                         contents=
                                         ["$origin/similarity/",
-                                         "$origin/position"]),
+                                         "$origin/position",
+                                         "$origin/pose_graph/nodes",
+                                         "$origin/pose_graph/edges/odometry",
+                                         "$origin/pose_graph/edges/loop_closure",
+                                        ]),
                       ],
                 ),
                 rrb.Tabs(
@@ -182,6 +223,9 @@ def setup_blueprint():
                                                 # "$origin/frontier_lines",
                                                 "$origin/path",
                                                 "$origin/path_simplified",
+                                                "$origin/pose_graph/nodes",
+                                                "$origin/pose_graph/edges/odometry",
+                                                "$origin/pose_graph/edges/loop_closure",
                                                 # "$origin/ground_truth",
                                                 # "$origin/frontiers",
                                                 # "$origin/frontiers_far",
@@ -265,6 +309,15 @@ def setup_blueprint():
     rr.log("map/frontiers_far", rr.Transform3D(translation=np.array([0, 600, 0]),
                                                rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                              angle=rr.datatypes.Angle(rad=-np.pi))))
+    for pose_path in [
+        "map/pose_graph/nodes",
+        "map/pose_graph/edges/odometry",
+        "map/pose_graph/edges/loop_closure",
+    ]:
+        rr.log(pose_path,
+               rr.Transform3D(translation=np.array([0, 600, 0]),
+                              rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
+                                                            angle=rr.datatypes.Angle(rad=-np.pi))))
 
 
 class RerunLogger:

@@ -1,6 +1,6 @@
 EvalConf:
   multi_object: false
-  max_steps: 1000
+  max_steps: 500
   max_dist: 1.0
   is_gibson: False
   object_nav_path: "datasets/objectnav_hm3d_v1/val/content/"

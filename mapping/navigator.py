@@ -4,7 +4,7 @@ for navigation and exploration.
 """
 import time
 
-from mapping import (OneMap, detect_frontiers, get_frontier_midpoint,
+from mapping import (OneMap, PoseGraph, detect_frontiers, get_frontier_midpoint,
                      cluster_high_similarity_regions, find_local_maxima,
                      watershed_clustering, gradient_based_clustering, cluster_thermal_image,
                      Cluster, NavGoal, Frontier)
@@ -144,6 +144,11 @@ class Navigator:
         self.sam_predictor = SamPredictor(self.sam)
 
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
+        
+        # Initialize pose graph with database support
+        db_path = getattr(config, 'pose_graph_db_path', 'pose_graph.db')
+        session_name = getattr(config, 'session_name', f"session_{int(time.time())}")
+        self.pose_graph = PoseGraph(db_path=db_path, session_name=session_name)
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
@@ -489,6 +494,9 @@ class Navigator:
         x = odometry[0, 3]
         y = odometry[1, 3]
         yaw = np.arctan2(odometry[1, 0], odometry[0, 0])
+        self.pose_graph.add_pose(x, y, yaw)
+        if self.log:
+            self.pose_graph.log_to_rerun(self.one_map)
 
         px, py = self.one_map.metric_to_px(x, y)
         if self.last_pose:
@@ -677,6 +685,26 @@ class Navigator:
             self.object_detected = False
             return True
         self.last_pose = (px, py, yaw)
+
+    def get_pose_graph_statistics(self) -> dict:
+        """Get pose graph statistics for monitoring."""
+        return self.pose_graph.get_statistics()
+
+    def export_pose_graph(self, filepath: str) -> None:
+        """Export pose graph to file."""
+        self.pose_graph.export_to_file(filepath)
+
+    def check_loop_closure(self, current_node_id: int) -> Optional[int]:
+        """Simple loop closure detection based on spatial proximity."""
+        candidates = self.pose_graph.find_loop_closure_candidates(
+            current_node_id, distance_threshold=0.5
+        )
+        
+        if candidates:
+            # For now, just return the closest candidate
+            # In a real implementation, you'd use visual features for verification
+            return candidates[0]
+        return None
 
     def get_map(self,
                 return_map=True
