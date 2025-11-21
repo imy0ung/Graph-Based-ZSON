@@ -43,7 +43,7 @@ if __name__ == "__main__":
         raise NotImplementedError("Spot controller not suited for habitat sim")
 
     model = ClipModel("weights/clip.pth")
-    detector = YOLOWorldDetector(0.3)
+    detector = YOLOWorldDetector(0.8)
     mapper = Navigator(model, detector, config)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
     mapper.set_query(["A Couch"])

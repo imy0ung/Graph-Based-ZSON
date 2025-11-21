@@ -8,7 +8,7 @@ import numpy as np
 import rerun as rr
 
 
-PoseEdgeType = Literal["odometry", "loop_closure"]
+PoseEdgeType = Literal["odometry"]
 
 
 @dataclass
@@ -79,10 +79,6 @@ class PoseGraph:
         self._dirty = True
         return node_id
 
-    def add_loop_closure(self, source: int, target: int) -> None:
-        if source == target:
-            return
-        self._add_edge(source, target, "loop_closure")
 
     def _add_edge(self, source: int, target: int, edge_type: PoseEdgeType) -> None:
         edge = PoseEdge(source, target, edge_type)
@@ -117,22 +113,14 @@ class PoseGraph:
 
     def _log_edges(self, node_pixels: np.ndarray) -> None:
         odom_edges: List[Sequence[Sequence[float]]] = []
-        loop_edges: List[Sequence[Sequence[float]]] = []
         for edge in self.edges:
             segment = [node_pixels[edge.source], node_pixels[edge.target]]
-            if edge.edge_type == "loop_closure":
-                loop_edges.append(segment)
-            else:
-                odom_edges.append(segment)
+            odom_edges.append(segment)
 
         if odom_edges:
             rr.log("map/pose_graph/edges/odometry",
                    rr.LineStrips2D(np.array(odom_edges, dtype=np.float32),
                                    colors=[[51, 153, 255]] * len(odom_edges)))
-        if loop_edges:
-            rr.log("map/pose_graph/edges/loop_closure",
-                   rr.LineStrips2D(np.array(loop_edges, dtype=np.float32),
-                                   colors=[[255, 102, 0]] * len(loop_edges)))
 
     def load_from_database(self, session_id: Optional[int] = None) -> None:
         """Load pose graph from database."""
@@ -150,31 +138,11 @@ class PoseGraph:
         
         # Load edges for these nodes
         self.edges = []
-        for edge_type in ["odometry", "loop_closure"]:
-            edges = self.db.get_edges_by_type(edge_type)
-            self.edges.extend(edges)
+        edges = self.db.get_edges_by_type("odometry")
+        self.edges.extend(edges)
         
         self._dirty = True
 
-    def find_loop_closure_candidates(self, current_node_id: int, 
-                                   distance_threshold: float = 1.0) -> List[int]:
-        """Find potential loop closure candidates near the current pose."""
-        if not self.nodes or current_node_id >= len(self.nodes):
-            return []
-        
-        current_node = self.nodes[current_node_id]
-        candidates = []
-        
-        # Look for nodes that are spatially close but temporally distant
-        for i, node in enumerate(self.nodes):
-            if abs(i - current_node_id) < 10:  # Skip recent nodes
-                continue
-            
-            distance = np.hypot(node.x - current_node.x, node.y - current_node.y)
-            if distance < distance_threshold:
-                candidates.append(i)
-        
-        return candidates
 
     def get_trajectory_length(self) -> float:
         """Calculate total trajectory length from odometry edges."""
@@ -192,8 +160,7 @@ class PoseGraph:
         stats = {
             'node_count': len(self.nodes),
             'edge_count': len(self.edges),
-            'odometry_edges': len([e for e in self.edges if e.edge_type == "odometry"]),
-            'loop_closure_edges': len([e for e in self.edges if e.edge_type == "loop_closure"]),
+            'odometry_edges': len(self.edges),
             'trajectory_length': self.get_trajectory_length()
         }
         
