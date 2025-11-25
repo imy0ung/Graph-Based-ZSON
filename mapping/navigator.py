@@ -12,6 +12,7 @@ from mapping import (OneMap, PoseGraph, detect_frontiers, get_frontier_midpoint,
 from planning import Planning
 from vision_models.base_model import BaseModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
+from vision_models.yolov8_model import YoloV8Detector
 from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 from config import Conf, load_config
 from config import SpotControllerConf
@@ -21,7 +22,7 @@ from mobile_sam import sam_model_registry, SamPredictor
 import numpy as np
 
 # typing
-from typing import List, Optional, Set, Any, Union
+from typing import List, Optional, Set, Any, Union, Tuple
 
 # torch
 import torch
@@ -135,7 +136,14 @@ class Navigator:
 
         # Models
         self.model = model
-        self.detector = detector
+        self.detector = detector  # Target object detector (YOLOWorldDetector)
+        # COCO object detector for pose graph registration
+        try:
+            self.coco_detector = YoloV8Detector(confidence_threshold=0.8)
+            self.coco_detector.set_classes(None)  # Detect all COCO classes
+        except Exception as e:
+            print(f"Warning: Could not initialize COCO detector: {e}")
+            self.coco_detector = None
         sam_model_t = "vit_t"
         sam_checkpoint = "weights/mobile_sam.pt"
         self.sam = sam_model_registry[sam_model_t](checkpoint=sam_checkpoint)
@@ -523,11 +531,133 @@ class Navigator:
             warnings.warn("Camera matrix not set, please set camera matrix first")
             return
 
-        # detections = self.detector.detect(np.flip(image, axis=0))
-        # Check if RGB or BGR correct?
-        # TODO I think yolo wants rgb
-        # detections = self.detector.detect(np.flip(image.transpose(1, 2, 0), axis=-1))
-        detections = self.detector.detect(image.transpose(1, 2, 0))
+        # Prepare RGB image (H, W, C) format
+        rgb_image = image.transpose(1, 2, 0)
+        sam_image_set = False
+
+        # Target object detection (for navigation)
+        detections = self.detector.detect(rgb_image)
+        
+        # COCO object detection for pose graph registration (runs every frame)
+        if self.coco_detector is not None:
+            coco_detections = self.coco_detector.detect(rgb_image)
+            current_pose_id = self.pose_graph.pose_ids[-1] if self.pose_graph.pose_ids else None
+            mask_overlay_ids = np.zeros(depth.shape, dtype=np.uint16) if self.log else None
+            mask_annotation_infos: List[rr.AnnotationInfo] = []
+            
+            # Log RGB image and COCO detections to Rerun
+            if self.log:
+                # Log RGB image (convert from [C, H, W] to [H, W, C])
+                rgb_for_logging = rgb_image
+                # Ensure image is uint8 and in correct format
+                if rgb_for_logging.dtype != np.uint8:
+                    rgb_for_logging = (rgb_for_logging * 255).astype(np.uint8) if rgb_for_logging.max() <= 1.0 else rgb_for_logging.astype(np.uint8)
+                
+                # Log image first (under camera/ to match blueprint)
+                rr.log("camera/rgb", rr.Image(rgb_for_logging).compress(jpeg_quality=85))
+                
+                # Log COCO detection boxes if any (same path as image for overlay)
+                num_boxes = len(coco_detections.get("boxes", []))
+                if num_boxes > 0:
+                    boxes = np.array(coco_detections["boxes"], dtype=np.float32)
+                    # Ensure boxes are in correct format [x1, y1, x2, y2]
+                    if len(boxes.shape) == 2 and boxes.shape[1] == 4:
+                        labels = [f"{name} {score:.2f}" for name, score in 
+                                 zip(coco_detections["class_names"], coco_detections["scores"])]
+                        # Log boxes to same path as image (Rerun will overlay them)
+                        rr.log("camera/rgb", 
+                               rr.Boxes2D(
+                                   array_format=rr.Box2DFormat.XYXY,
+                                   array=boxes,
+                                   labels=labels
+                               ))
+                        # Debug: print detection info
+                        if self.pose_graph._step_counter % 10 == 0:
+                            print(f"[COCO] Step {self.pose_graph._step_counter}: {num_boxes} detections logged to camera/rgb")
+            
+            if current_pose_id and len(coco_detections.get("boxes", [])) > 0 and "class_names" in coco_detections:
+                # Collect all valid observations first
+                observations = []
+                if not sam_image_set:
+                    self.sam_predictor.set_image(rgb_image)
+                    sam_image_set = True
+
+                for det_idx, (box, score, class_name) in enumerate(zip(coco_detections["boxes"],
+                                                                        coco_detections["scores"],
+                                                                        coco_detections["class_names"])):
+                    position_w = None
+                    pixel_center = None
+                    try:
+                        masks, _, _ = self.sam_predictor.predict(
+                            point_coords=None,
+                            point_labels=None,
+                            box=np.array(box)[None, :],
+                            multimask_output=False,
+                        )
+                        mask_bool = masks[0].astype(bool)
+                        mask_result = self._compute_world_center_from_mask(mask_bool, depth, yaw, odometry)
+                        if mask_result is not None:
+                            position_w, pixel_center = mask_result
+                            if self.log:
+                                if mask_overlay_ids is not None:
+                                    class_idx = len(mask_annotation_infos) + 1
+                                    mask_overlay_ids[mask_bool] = class_idx
+                                    mask_annotation_infos.append(
+                                        rr.AnnotationInfo(
+                                            id=class_idx,
+                                            label=f"{class_name} ({score:.2f})",
+                                            color=[0, 255, 0, 120],
+                                        )
+                                    )
+                                rr.log("camera/rgb",
+                                       rr.Points2D(
+                                           np.array([[pixel_center[0], pixel_center[1]]], dtype=np.float32),
+                                           colors=[[0, 255, 0]],
+                                           radii=[3],
+                                       ))
+                    except Exception as e:
+                        if self.pose_graph._step_counter % 100 == 0:
+                            print(f"[COCO] SAM segmentation failed: {e}")
+
+                    if position_w is None:
+                        # Fallback to bounding-box center depth projection
+                        center_x = int((box[0] + box[2]) / 2)
+                        center_y = int((box[1] + box[3]) / 2)
+                        
+                        if 0 <= center_y < depth.shape[0] and 0 <= center_x < depth.shape[1]:
+                            obj_depth = depth[center_y, center_x]
+                            if 0 < obj_depth < 5.0:
+                                y_world = -(center_x - self.one_map.cx) * obj_depth / self.one_map.fx
+                                x_world = obj_depth
+                                r = np.array([[np.cos(yaw), -np.sin(yaw)],
+                                              [np.sin(yaw), np.cos(yaw)]])
+                                x_rot, y_rot = np.dot(r, np.array([x_world, y_world]))
+                                x_world_final = x_rot + odometry[0, 3]
+                                y_world_final = y_rot + odometry[1, 3]
+                                position_w = np.array([x_world_final, y_world_final, 0.0])
+
+                    if position_w is not None:
+                        observations.append({
+                            "label": class_name,
+                            "position_w": position_w,
+                            "confidence": float(score),
+                            "embedding": None,  # Can add CLIP embedding later if needed
+                        })
+                
+                # Process all observations in batch
+                if observations:
+                    if self.log and mask_overlay_ids is not None and mask_overlay_ids.any():
+                        if mask_annotation_infos:
+                            rr.log("camera/rgb/mask_annotations", rr.AnnotationContext(mask_annotation_infos))
+                        rr.log("camera/rgb/masks", rr.SegmentationImage(mask_overlay_ids))
+                    self.pose_graph.add_object_nodes_batch(
+                        pose_id=current_pose_id,
+                        observations=observations,
+                        step=self.pose_graph._step_counter,
+                        distance_threshold=1.0,
+                        use_kalman=True,
+                        mahalanobis_threshold=3.0,
+                    )
         a = time.time()
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         b = time.time()
@@ -550,7 +680,9 @@ class Navigator:
         self.saw_right = False
         if len(detections["boxes"]) > 0:
             # wants rgb
-            self.sam_predictor.set_image(image.transpose(1, 2, 0))
+            if not sam_image_set:
+                self.sam_predictor.set_image(rgb_image)
+                sam_image_set = True
             for area, confidence in zip(detections["boxes"], detections['scores']):
                 if self.log:
                     rr.log("camera/detection", rr.Boxes2D(array_format=rr.Box2DFormat.XYXY, array=area))
@@ -689,6 +821,42 @@ class Navigator:
     def get_pose_graph_statistics(self) -> dict:
         """Get pose graph statistics for monitoring."""
         return self.pose_graph.get_statistics()
+
+    def _compute_world_center_from_mask(
+        self,
+        mask: np.ndarray,
+        depth: np.ndarray,
+        yaw: float,
+        odometry: np.ndarray,
+        max_depth: float = 5.0,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        """
+        Project a SAM mask to world coordinates and return the centroid.
+        
+        Returns:
+            Tuple of (world_center (3,), pixel_center (2,)) if successful, otherwise None.
+        """
+        valid_mask = mask & (depth > 0) & (depth < max_depth)
+        if not np.any(valid_mask):
+            return None
+        
+        indices = np.argwhere(valid_mask)
+        depth_vals = depth[valid_mask].astype(np.float32)
+        pixel_x = indices[:, 1].astype(np.float32)
+        pixel_y = indices[:, 0].astype(np.float32)
+        
+        y_cam = -(pixel_x - self.one_map.cx) * depth_vals / self.one_map.fx
+        x_cam = depth_vals
+        
+        rot = np.array([[np.cos(yaw), -np.sin(yaw)],
+                        [np.sin(yaw), np.cos(yaw)]], dtype=np.float32)
+        x_rot, y_rot = np.dot(rot, np.vstack((x_cam, y_cam)))
+        x_world = x_rot + odometry[0, 3]
+        y_world = y_rot + odometry[1, 3]
+        
+        center_world = np.array([np.mean(x_world), np.mean(y_world), 0.0], dtype=np.float32)
+        center_pixel = np.array([np.mean(pixel_x), np.mean(pixel_y)], dtype=np.float32)
+        return center_world, center_pixel
 
     def export_pose_graph(self, filepath: str) -> None:
         """Export pose graph to file."""

@@ -2,6 +2,7 @@
 This script is used to test the habitat-sim library together with OneMap
 """
 import time
+from pathlib import Path
 
 # habitat
 import habitat_sim
@@ -42,11 +43,18 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError("Spot controller not suited for habitat sim")
 
+    # Initialize database - reset for each run
+    db_path = "pose_graph.db"
+    if Path(db_path).exists():
+        print(f"Removing existing database: {db_path}")
+        Path(db_path).unlink()
+    
     model = ClipModel("weights/clip.pth")
+    # Target object detector (for navigation)
     detector = YOLOWorldDetector(0.8)
     mapper = Navigator(model, detector, config)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
-    mapper.set_query(["A Couch"])
+    mapper.set_query(["A Couch"])  # Target object for navigation
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration()
@@ -184,6 +192,14 @@ if __name__ == "__main__":
             observations["rgb"][:, :, :-1].transpose(2, 0, 1), observations["depth"].astype(np.float32),
                         transformation_matrix)
         print("Time taken to add data: ", time.time() - t)
+        
+        # Print graph statistics periodically
+        if mapper.pose_graph._step_counter % 50 == 0:
+            stats = mapper.pose_graph.get_statistics()
+            print(f"\n[Step {mapper.pose_graph._step_counter}] Graph Stats:")
+            print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "
+                  f"Edges: {stats['edge_count']} (pose_pose: {stats['pose_pose_edges']}, "
+                  f"pose_object: {stats['pose_object_edges']})")
 
         cam_x = pos[0, 0]
         cam_y = pos[1, 0]
@@ -194,6 +210,18 @@ if __name__ == "__main__":
             logger.log_map()
             logger.log_pos(cam_x, cam_y)
         if obj_found:
-            mapper.set_query([qs[0]])
-            qs.pop(0)
+            if len(qs) > 0:
+                mapper.set_query([qs[0]])
+                qs.pop(0)
+            else:
+                # All objects found, exit
+                print("All target objects found. Exiting...")
+                running = False
+                break
             continue
+        
+        # Exit if no more queries and no path
+        if len(qs) == 0 and (mapper.get_path() is None or len(mapper.get_path()) == 0):
+            print("No more queries and no path. Exiting...")
+            running = False
+            break

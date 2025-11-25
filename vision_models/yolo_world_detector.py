@@ -34,7 +34,9 @@ class YOLOWorldDetector:
 
         preds = {
             "boxes": [],
-            "scores": []
+            "scores": [],
+            "class_names": [],
+            "class_ids": []
         }
 
         for detection in results.predictions:
@@ -51,6 +53,8 @@ class YOLOWorldDetector:
                 if x1 != x2 and y1 != y2:
                     preds["boxes"].append([x1, y1, x2, y2])
                     preds["scores"].append(detection.confidence)
+                    preds["class_names"].append(class_name)
+                    preds["class_ids"].append(cls)
 
         return preds
 

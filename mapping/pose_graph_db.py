@@ -10,7 +10,9 @@ from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import asdict
 import numpy as np
 
-from .pose_graph import PoseNode, PoseEdge, PoseEdgeType
+from .pose_graph import PoseNode, Edge, PoseEdgeType
+# 호환성을 위해 Edge를 PoseEdge로도 사용
+PoseEdge = Edge
 
 
 class PoseGraphDB:
@@ -45,7 +47,7 @@ class PoseGraphDB:
                 edge_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_id INTEGER NOT NULL,
                 target_id INTEGER NOT NULL,
-                edge_type TEXT NOT NULL CHECK (edge_type IN ('odometry', 'loop_closure')),
+                edge_type TEXT NOT NULL,
                 transform_matrix TEXT,
                 covariance TEXT,
                 confidence REAL DEFAULT 1.0,
@@ -53,6 +55,23 @@ class PoseGraphDB:
                 FOREIGN KEY (source_id) REFERENCES pose_nodes (node_id),
                 FOREIGN KEY (target_id) REFERENCES pose_nodes (node_id),
                 UNIQUE(source_id, target_id, edge_type)
+            )
+        """)
+        
+        # Object nodes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS object_nodes (
+                node_id TEXT PRIMARY KEY,
+                label TEXT NOT NULL,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                z REAL NOT NULL,
+                confidence REAL NOT NULL,
+                num_observations INTEGER DEFAULT 1,
+                last_seen_step INTEGER DEFAULT 0,
+                embedding BLOB,
+                position_covariance TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
         
@@ -118,14 +137,52 @@ class PoseGraphDB:
         transform_json = json.dumps(transform_matrix.tolist()) if transform_matrix is not None else None
         covariance_json = json.dumps(covariance.tolist()) if covariance is not None else None
         
+        # Extract numeric IDs from string IDs (e.g., "pose_123" -> 123)
+        source_id = edge.source if isinstance(edge.source, int) else int(edge.source.split('_')[-1]) if '_' in edge.source else hash(edge.source) % (2**31)
+        target_id = edge.target if isinstance(edge.target, int) else int(edge.target.split('_')[-1]) if '_' in edge.target else hash(edge.target) % (2**31)
+        
         cursor.execute("""
             INSERT OR REPLACE INTO pose_edges 
             (source_id, target_id, edge_type, transform_matrix, covariance, confidence)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (edge.source, edge.target, edge.edge_type, transform_json, covariance_json, confidence))
+        """, (source_id, target_id, edge.edge_type, transform_json, covariance_json, confidence))
         
         self.conn.commit()
         return cursor.lastrowid
+    
+    def add_object_node(self, obj_node, session_id: Optional[int] = None) -> str:
+        """Add an object node to the database."""
+        from .pose_graph import ObjectNode
+        assert isinstance(obj_node, ObjectNode)
+        
+        cursor = self.conn.cursor()
+        
+        # Serialize embedding and covariance
+        embedding_blob = None
+        if obj_node.embedding is not None:
+            embedding_blob = obj_node.embedding.tobytes()
+        
+        covariance_json = json.dumps(obj_node.position_covariance.tolist()) if obj_node.position_covariance is not None else None
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO object_nodes 
+            (node_id, label, x, y, z, confidence, num_observations, last_seen_step, embedding, position_covariance)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            obj_node.id,
+            obj_node.label,
+            float(obj_node.position[0]),
+            float(obj_node.position[1]),
+            float(obj_node.position[2]),
+            float(obj_node.confidence),
+            int(obj_node.num_observations),
+            int(obj_node.last_seen_step),
+            embedding_blob,
+            covariance_json
+        ))
+        
+        self.conn.commit()
+        return obj_node.id
     
     def get_node(self, node_id: int) -> Optional[PoseNode]:
         """Retrieve a pose node by ID."""
@@ -167,10 +224,17 @@ class PoseGraphDB:
         
         edges = []
         for row in cursor.fetchall():
-            edges.append(PoseEdge(
-                source=row['source_id'],
-                target=row['target_id'],
-                edge_type=row['edge_type']
+            # Edge 생성 (호환성을 위해 id 생성)
+            edge_id = f"e_{row['source_id']}_{row['target_id']}_{row['edge_type']}"
+            src_id = f"pose_{row['source_id']}"
+            dst_id = f"pose_{row['target_id']}"
+            edges.append(Edge(
+                id=edge_id,
+                kind=row['edge_type'],
+                src=src_id,
+                dst=dst_id,
+                T_rel=None,
+                rel_pos=None
             ))
         return edges
     
@@ -192,10 +256,19 @@ class PoseGraphDB:
                 y=row['y'],
                 theta=row['theta']
             )
-            edge = PoseEdge(
-                source=min(node_id, row['node_id']),
-                target=max(node_id, row['node_id']),
-                edge_type=row['edge_type']
+            # Edge 생성 (호환성을 위해 id 생성)
+            source_id = min(node_id, row['node_id'])
+            target_id = max(node_id, row['node_id'])
+            edge_id = f"e_{source_id}_{target_id}_{row['edge_type']}"
+            src_id = f"pose_{source_id}"
+            dst_id = f"pose_{target_id}"
+            edge = Edge(
+                id=edge_id,
+                kind=row['edge_type'],
+                src=src_id,
+                dst=dst_id,
+                T_rel=None,
+                rel_pos=None
             )
             neighbors.append((node, edge))
         return neighbors
@@ -238,6 +311,10 @@ class PoseGraphDB:
         cursor.execute("SELECT COUNT(*) as count FROM pose_nodes")
         node_count = cursor.fetchone()['count']
         
+        # Object node count
+        cursor.execute("SELECT COUNT(*) as count FROM object_nodes")
+        object_count = cursor.fetchone()['count']
+        
         # Edge counts by type
         cursor.execute("""
             SELECT edge_type, COUNT(*) as count 
@@ -246,7 +323,7 @@ class PoseGraphDB:
         """)
         edge_counts = {row['edge_type']: row['count'] for row in cursor.fetchall()}
         
-        # Trajectory length (sum of odometry edges)
+        # Trajectory length (sum of pose_pose edges)
         cursor.execute("""
             SELECT 
                 SUM(SQRT(
@@ -256,12 +333,13 @@ class PoseGraphDB:
             FROM pose_edges e
             JOIN pose_nodes n1 ON e.source_id = n1.node_id
             JOIN pose_nodes n2 ON e.target_id = n2.node_id
-            WHERE e.edge_type = 'odometry'
+            WHERE e.edge_type = 'pose_pose' OR e.edge_type = 'odometry'
         """)
         total_distance = cursor.fetchone()['total_distance'] or 0.0
         
         return {
             'node_count': node_count,
+            'object_count': object_count,
             'edge_counts': edge_counts,
             'total_distance': total_distance,
             'database_size': self.db_path.stat().st_size if self.db_path.exists() else 0
