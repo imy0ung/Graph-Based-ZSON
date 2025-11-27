@@ -434,24 +434,13 @@ class Navigator:
             # clusters = cluster_high_similarity_regions(normalized_map, map_def > 0.0)
             for cluster in clusters:
                 cluster.compute_score(adjusted_score)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any(
+                if len(self.blacklisted_nav_goals) == 0 or not np.any( #
                         np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
                     if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
                                                                          measureDist=True) > -15.0) or
                         self.one_map.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
                             (not self.one_map.checked_map[cluster.center[0], cluster.center[1]]):
                         self.nav_goals.append(cluster)
-            if self.log:
-                cluster_max_similarity = np.zeros_like(self.previous_sims[0])
-
-                # Fill each cluster with its maximum similarity value
-                min_c = np.min([cluster.get_score() for cluster in clusters])
-                max_c = np.max([cluster.get_score() for cluster in clusters])
-                for cluster in clusters:
-                    cluster_pts = cluster.points
-                    score = (cluster.get_score() - min_c) / (max_c - min_c)
-                    cluster_max_similarity[cluster_pts[:, 0], cluster_pts[:, 1]] = score
-                log_map_rerun(cluster_max_similarity, path="map/similarity_th2")
 
             if self.log:
                 log_map_rerun(unexplored_map, path="map/unexplored")
@@ -475,14 +464,6 @@ class Navigator:
                     valid_frontiers_mask[i_frontier] = True
                     self.nav_goals.append(
                         Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score))
-
-            if self.log:
-                if len(self.nav_goals) > 0:
-                    pts = np.array([nav_goal.get_descr_point() for nav_goal in self.nav_goals])
-                    scores = np.array([nav_goal.get_score() for nav_goal in self.nav_goals])
-                    rr.log("map/frontiers",
-                           rr.Points2D(pts, colors=np.flip(monochannel_to_inferno_rgb(scores), axis=-1),
-                                       radii=[1] * pts.shape[0]))
 
             self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
 
@@ -728,7 +709,7 @@ class Navigator:
                                                self.percentile_exploitation)
                         top_map = (adjusted_score > top_10).astype(np.uint8)
 
-                        print(top_10)
+                        # print(top_10)  # Debug output disabled
                         top_map[self.one_map.confidence_map == 0] = 0
                         k = np.ones((7, 7), np.uint8)
                         top_map = cv2.dilate(top_map, k, iterations=1)

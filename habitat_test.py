@@ -25,6 +25,7 @@ from scipy.spatial.transform import Rotation as R
 
 # MON
 from mapping import Navigator
+from mapping import Frontier
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
 
@@ -191,7 +192,16 @@ if __name__ == "__main__":
         obj_found = mapper.add_data(
             observations["rgb"][:, :, :-1].transpose(2, 0, 1), observations["depth"].astype(np.float32),
                         transformation_matrix)
-        print("Time taken to add data: ", time.time() - t)
+        # print("Time taken to add data: ", time.time() - t)
+        
+        # Print nav_goals coordinates for debugging (every 10 steps)
+        if mapper.pose_graph._step_counter % 10 == 0:
+            print(f"\n[Step {mapper.pose_graph._step_counter}] Nav Goals ({len(mapper.nav_goals)} total):")
+            for i, nav_goal in enumerate(mapper.nav_goals):
+                coord = nav_goal.get_descr_point()
+                score = nav_goal.get_score()
+                goal_type = type(nav_goal).__name__
+                print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
         
         # Print graph statistics periodically
         if mapper.pose_graph._step_counter % 50 == 0:
@@ -209,6 +219,43 @@ if __name__ == "__main__":
                     observations["depth"].max() - observations["depth"].min())))
             logger.log_map()
             logger.log_pos(cam_x, cam_y)
+            
+            # Extract and visualize Frontier coordinates in rerun (every 10 steps)
+            if mapper.pose_graph._step_counter % 10 == 0:
+                frontier_coords = []
+                for nav_goal in mapper.nav_goals:
+                    if isinstance(nav_goal, Frontier):
+                        coord = nav_goal.get_descr_point()
+                        # Convert from [y, x] to [x, y] for rerun visualization (same as path)
+                        frontier_coords.append([coord[1], coord[0]])
+                
+                if len(frontier_coords) > 0:
+                    # Create small circles for each frontier
+                    radius = 1.5  # Smaller radius
+                    num_points = 32  # Number of points to approximate circle
+                    
+                    # Generate circle points
+                    angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
+                    circle_x = np.cos(angles) * radius
+                    circle_y = np.sin(angles) * radius
+                    
+                    # Create LineStrips2D for each frontier
+                    circle_strips = []
+                    green_color = [0, 255, 0]  # Green color
+                    
+                    for center in frontier_coords:
+                        circle = np.array([
+                            [center[0] + x, center[1] + y] 
+                            for x, y in zip(circle_x, circle_y)
+                        ], dtype=np.float32)
+                        # Close the circle
+                        circle = np.vstack([circle, circle[0:1]])
+                        circle_strips.append(circle)
+                    
+                    # Log all circles
+                    rr.log("map/frontiers_only", 
+                           rr.LineStrips2D(circle_strips, 
+                                         colors=[green_color] * len(circle_strips)))
         if obj_found:
             if len(qs) > 0:
                 mapper.set_query([qs[0]])

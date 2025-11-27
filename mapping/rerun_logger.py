@@ -47,8 +47,6 @@ def setup_blueprint_debug():
                                         contents=
                                         ["$origin/similarity/",
                                          "$origin/proj_detect",
-                                         "$origin/frontiers",
-                                         "$origin/frontiers_far",
                                          "$origin/position",
                                          "$origin/pose_graph/nodes",
                                          "$origin/pose_graph/edges/odometry",
@@ -60,18 +58,6 @@ def setup_blueprint_debug():
                                         name="SimilarityTresholded",
                                         contents=
                                         ["$origin/similarity_th/",
-                                         "$origin/proj_detect",
-                                         "$origin/position",
-                                         "$origin/pose_graph/nodes",
-                                         "$origin/pose_graph/edges/odometry",
-                                         "$origin/pose_graph/edges/loop_closure",
-                                         "$origin/pose_graph/objects",
-                                         "$origin/pose_graph/edges/pose_object",
-                                        ]),
-                      rrb.Spatial2DView(origin="map",
-                                        name="SimilarityTresholdedCl",
-                                        contents=
-                                        ["$origin/similarity_th2/",
                                          "$origin/proj_detect",
                                          "$origin/position",
                                          "$origin/pose_graph/nodes",
@@ -94,8 +80,6 @@ def setup_blueprint_debug():
                                                 "$origin/path",
                                                 "$origin/path_simplified",
                                                 "$origin/ground_truth",
-                                                "$origin/frontiers",
-                                                "$origin/frontiers_far",
                                                 "$origin/pose_graph/nodes",
                                                 "$origin/pose_graph/edges/odometry",
                                                 "$origin/pose_graph/edges/loop_closure",
@@ -118,9 +102,7 @@ def setup_blueprint_debug():
                                                ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Unexplored",
-                                      contents=["$origin/frontiers",
-                                                "$origin/frontiers_far",
-                                                "$origin/largest_contour",
+                                      contents=["$origin/largest_contour",
                                                 "$origin/position",
                                                 "$origin/unexplored",
                                                 "$origin/pose_graph/nodes",
@@ -141,10 +123,6 @@ def setup_blueprint_debug():
                                                rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                              angle=rr.datatypes.Angle(
                                                                                  rad=-np.pi / 2))))
-    rr.log("map/similarity_th2", rr.Transform3D(translation=np.array([0, 600, 0]),
-                                                rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
-                                                                              angle=rr.datatypes.Angle(
-                                                                                  rad=-np.pi / 2))))
     rr.log("map/traversable", rr.Transform3D(translation=np.array([0, 600, 0]),
                                              rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                            angle=rr.datatypes.Angle(rad=-np.pi / 2))))
@@ -195,10 +173,7 @@ def setup_blueprint_debug():
     rr.log("map/ground_truth", rr.Transform3D(translation=np.array([0, 600, 0]),
                                               rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                             angle=rr.datatypes.Angle(rad=-np.pi))))
-    rr.log("map/frontiers", rr.Transform3D(translation=np.array([0, 600, 0]),
-                                           rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
-                                                                         angle=rr.datatypes.Angle(rad=-np.pi))))
-    rr.log("map/frontiers_far", rr.Transform3D(translation=np.array([0, 600, 0]),
+    rr.log("map/frontiers_only", rr.Transform3D(translation=np.array([0, 600, 0]),
                                                rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                              angle=rr.datatypes.Angle(rad=-np.pi))))
     for pose_path in [
@@ -255,8 +230,7 @@ def setup_blueprint():
                                                 "$origin/pose_graph/edges/odometry",
                                                 "$origin/pose_graph/edges/loop_closure",
                                                 # "$origin/ground_truth",
-                                                # "$origin/frontiers",
-                                                # "$origin/frontiers_far",
+                                                "$origin/frontiers_only",
                                                 "$origin/explored_objects",
                                                 "$origin/explored_edges/pose_object",
                                                 ]),
@@ -287,10 +261,6 @@ def setup_blueprint():
                                                rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                              angle=rr.datatypes.Angle(
                                                                                  rad=-np.pi / 2))))
-    rr.log("map/similarity_th2", rr.Transform3D(translation=np.array([0, 600, 0]),
-                                                rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
-                                                                              angle=rr.datatypes.Angle(
-                                                                                  rad=-np.pi / 2))))
     rr.log("map/traversable", rr.Transform3D(translation=np.array([0, 600, 0]),
                                              rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                            angle=rr.datatypes.Angle(rad=-np.pi / 2))))
@@ -337,10 +307,7 @@ def setup_blueprint():
     rr.log("map/ground_truth", rr.Transform3D(translation=np.array([0, 600, 0]),
                                               rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                             angle=rr.datatypes.Angle(rad=-np.pi))))
-    rr.log("map/frontiers", rr.Transform3D(translation=np.array([0, 600, 0]),
-                                           rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
-                                                                         angle=rr.datatypes.Angle(rad=-np.pi))))
-    rr.log("map/frontiers_far", rr.Transform3D(translation=np.array([0, 600, 0]),
+    rr.log("map/frontiers_only", rr.Transform3D(translation=np.array([0, 600, 0]),
                                                rotation=rr.RotationAxisAngle(axis=[1, 0, 0],
                                                                              angle=rr.datatypes.Angle(rad=-np.pi))))
     for pose_path in [
