@@ -304,28 +304,47 @@ class Navigator:
                     top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[1].get_score()))
 
                 # We have a frontier and we need to consider following up on that
+                # Filter out Cluster types - they should not be considered as navigation goals
+                valid_nav_goals = [nav_goal for nav_goal in self.nav_goals if not isinstance(nav_goal, Cluster)]
+                if len(valid_nav_goals) == 0:
+                    # No valid nav goals (only clusters), remove all and reset
+                    self.nav_goals = []
+                    break
+                
                 curr_index = None
-                if self.last_nav_goal is not None:
+                if self.last_nav_goal is not None and not isinstance(self.last_nav_goal, Cluster):
                     last_pt = self.last_nav_goal.get_descr_point()
                     for nav_id in range(len(self.nav_goals)):
-                        if np.array_equal(last_pt, self.nav_goals[nav_id].get_descr_point()):
+                        nav_goal = self.nav_goals[nav_id]
+                        if isinstance(nav_goal, Cluster):
+                            continue
+                        if np.array_equal(last_pt, nav_goal.get_descr_point()):
                             # frontier still exists!
                             curr_index = nav_id
                             break
                     if curr_index is None:
-                        closest_index = closest_point_within_threshold(self.nav_goals, last_pt,
+                        closest_index = closest_point_within_threshold(valid_nav_goals, last_pt,
                                                                        0.5 / self.one_map.cell_size)
                         if closest_index != -1:
-                            curr_index = closest_index
+                            # Map back to original index
+                            valid_idx = 0
+                            for nav_id in range(len(self.nav_goals)):
+                                if not isinstance(self.nav_goals[nav_id], Cluster):
+                                    if valid_idx == closest_index:
+                                        curr_index = nav_id
+                                        break
+                                    valid_idx += 1
                             # there is a close point to the previous frontier that we could consider instead
                     if curr_index is not None:
                         curr_value = self.nav_goals[curr_index].get_score()
                         if curr_value + 0.01 > self.last_nav_goal.get_score():
                             best_idx = curr_index
                 if best_idx is None:
-                    # Select the current best nav_goal, and check for cyclic
+                    # Select the current best nav_goal, and check for cyclic (excluding clusters)
                     for nav_id in range(len(self.nav_goals)):
                         nav_goal = self.nav_goals[nav_id]
+                        if isinstance(nav_goal, Cluster):
+                            continue
                         cyclic = self.cyclic_checker.check_cyclic(start, nav_goal.get_descr_point(), top_two_vals)
                         if cyclic:
                             continue
@@ -333,8 +352,19 @@ class Navigator:
                         # rr.log("path_updates", rr.TextLog(f"Selected frontier or POI based on score {self.frontiers[best_idx, 2]}. Max score is {self.frontiers[0, 2]}"))
 
                         break
+                
+                # If no valid nav goal found, break the loop
+                if best_idx is None:
+                    break
+                
                 # TODO We should check if the chosen waypoint is reachable via simple path planning!
                 best_nav_goal = self.nav_goals[best_idx]
+                # Double check that best_nav_goal is not a Cluster (should not happen, but safety check)
+                if isinstance(best_nav_goal, Cluster):
+                    # Remove cluster and continue to next iteration
+                    self.nav_goals.pop(best_idx)
+                    continue
+                    
                 self.cyclic_checker.add_state_action(start, best_nav_goal.get_descr_point(), top_two_vals)
                 if isinstance(best_nav_goal, Frontier):
                     self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & (
@@ -342,13 +372,6 @@ class Navigator:
                                                          (self.one_map.confidence_map > 0).cpu().numpy(),
                                                          best_nav_goal.get_descr_point(),
                                                          self.obstcl_kernel_size, 2)
-                elif isinstance(best_nav_goal, Cluster):
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & (
-                            self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         best_nav_goal.get_descr_point(),
-                                                         # TODO we might want to consider all the points of the cluster!
-                                                         self.obstcl_kernel_size, 4)
                 if self.path is None:
                     # remove the nav goal from the list, we don't know how to reach it
                     self.nav_goals.pop(best_idx)
@@ -406,17 +429,18 @@ class Navigator:
 
     def compute_frontiers_and_POIs(self, px, py):
         """
-        Computes the frontiers (at the border from fully explored to confidence > 0),
+        Computes the frontiers (VLFM style: at the border from explored to unexplored),
         and points of interest (high similarity regions within the fully explored, but not checked map)
         :return:
         """
         self.nav_goals = []
         if self.previous_sims is not None:
-            # Compute the frontiers
+            # Compute the frontiers using VLFM classical definition
+            # explored_area (confidence > 0) vs unexplored (confidence == 0)
             frontiers, unexplored_map, largest_contour = detect_frontiers(
                 self.one_map.navigable_map.astype(np.uint8),
-                self.one_map.fully_explored_map.astype(np.uint8),
-                self.one_map.confidence_map > 0,
+                self.one_map.explored_area.astype(np.uint8),
+                None,  # known_th parameter is not used in VLFM style
                 int(1.0 * ((
                                    self.one_map.n_cells /
                                    self.one_map.size) ** 2)))

@@ -76,6 +76,7 @@ class OneMap:
     navigable_map: np.ndarray  # binary traversability map where first dimension is x direction, second dimension is y
     # navigable likelihood
     fully_explored_map: np.ndarray  # binary explored map where first dimension is x direction, second dimension is y
+    explored_area: np.ndarray  # binary explored area map (VLFM style: any observation counts as explored)
     checked_map: np.ndarray  # binary checked map where first dimension is x direction, second dimension is y,
     # can be reset
     confidence_map: torch.Tensor
@@ -123,6 +124,7 @@ class OneMap:
         self.navigable_kernel = np.ones((col_kernel_size, col_kernel_size), np.uint8)
 
         self.fully_explored_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        self.explored_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
 
         self.confidence_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
@@ -181,6 +183,9 @@ class OneMap:
 
         # Reset fully explored map
         self.fully_explored_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+
+        # Reset explored area (VLFM style)
+        self.explored_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
 
         # Reset checked map
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
@@ -313,6 +318,12 @@ class OneMap:
 
             self.fully_explored_map = (np.nan_to_num(1.0 / self.confidence_map.cpu().numpy())
                                        < self.fully_explored_threshold)
+
+            # Update explored_area (VLFM style: any observation counts as explored)
+            # This is the classical frontier definition: explored (confidence > 0) vs unexplored (confidence == 0)
+            self.explored_area = (self.confidence_map > 0).cpu().numpy()
+            # Only mark navigable areas as explored
+            self.explored_area = self.explored_area & self.navigable_map
 
             self.checked_map = (np.nan_to_num(1.0 / self.checked_conf_map.cpu().numpy())
                                 < self.checked_map_threshold)
