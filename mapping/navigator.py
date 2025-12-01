@@ -171,6 +171,9 @@ class Navigator:
         self.last_pose = None
         self.saw_left = False
         self.saw_right = False
+        
+        # Track frontier nodes in pose graph: frontier_midpoint (tuple) -> frontier_node_id
+        self.frontier_node_map: dict = {}
 
         self.first_obs = True
         self.similar_points = None
@@ -237,6 +240,7 @@ class Navigator:
         self.nav_goals = []
         self.blacklisted_nav_goals = []
         self.artificial_obstacles = []
+        self.frontier_node_map = {}  # Reset frontier node mapping
 
     def set_camera_matrix(self,
                           camera_matrix: np.ndarray
@@ -308,6 +312,14 @@ class Navigator:
                 valid_nav_goals = [nav_goal for nav_goal in self.nav_goals if not isinstance(nav_goal, Cluster)]
                 if len(valid_nav_goals) == 0:
                     # No valid nav goals (only clusters), remove all and reset
+                    # Remove all frontier nodes from pose graph
+                    for nav_goal in self.nav_goals:
+                        if isinstance(nav_goal, Frontier):
+                            frontier_key = tuple(nav_goal.frontier_midpoint)
+                            if frontier_key in self.frontier_node_map:
+                                frontier_node_id = self.frontier_node_map[frontier_key]
+                                self.pose_graph._remove_frontier_node(frontier_node_id)
+                                del self.frontier_node_map[frontier_key]
                     self.nav_goals = []
                     break
                 
@@ -433,6 +445,16 @@ class Navigator:
         and points of interest (high similarity regions within the fully explored, but not checked map)
         :return:
         """
+        # Store current frontier midpoints before clearing nav_goals
+        current_frontier_midpoints = {tuple(nav_goal.frontier_midpoint) for nav_goal in self.nav_goals if isinstance(nav_goal, Frontier)}
+        
+        # Remove frontier nodes from pose graph for frontiers that are no longer in nav_goals
+        for frontier_key in list(self.frontier_node_map.keys()):
+            if frontier_key not in current_frontier_midpoints:
+                frontier_node_id = self.frontier_node_map[frontier_key]
+                self.pose_graph._remove_frontier_node(frontier_node_id)
+                del self.frontier_node_map[frontier_key]
+        
         self.nav_goals = []
         if self.previous_sims is not None:
             # Compute the frontiers using VLFM classical definition
@@ -486,8 +508,28 @@ class Navigator:
                 if len(self.blacklisted_nav_goals) == 0 or not np.any(
                         np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
                     valid_frontiers_mask[i_frontier] = True
-                    self.nav_goals.append(
-                        Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score))
+                    frontier_obj = Frontier(frontier_midpoint=frontier_mp, points=frontier, frontier_score=score)
+                    self.nav_goals.append(frontier_obj)
+                    
+                    # Add frontier to pose graph if not already exists
+                    frontier_key = tuple(frontier_mp)
+                    if frontier_key not in self.frontier_node_map:
+                        # Get current pose ID (the pose that first discovered this frontier)
+                        current_pose_id = self.pose_graph.pose_ids[-1] if self.pose_graph.pose_ids else None
+                        if current_pose_id:
+                            # Convert pixel coordinates to world coordinates
+                            x_world, y_world = self.one_map.px_to_metric(frontier_mp[0], frontier_mp[1])
+                            position_w = np.array([x_world, y_world, 0.0])
+                            
+                            # Add frontier node to pose graph
+                            fr_node = self.pose_graph.add_frontier_node(
+                                pose_id=current_pose_id,
+                                position_w=position_w,
+                                coarse_embedding=None,
+                                semantic_hint=None,
+                            )
+                            # Store mapping from frontier midpoint to node ID
+                            self.frontier_node_map[frontier_key] = fr_node.id
 
             self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
 

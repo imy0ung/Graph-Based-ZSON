@@ -197,11 +197,12 @@ if __name__ == "__main__":
         # Print nav_goals coordinates for debugging (every 10 steps)
         if mapper.pose_graph._step_counter % 10 == 0:
             print(f"\n[Step {mapper.pose_graph._step_counter}] Nav Goals ({len(mapper.nav_goals)} total):")
-            for i, nav_goal in enumerate(mapper.nav_goals):
+            for i, nav_goal in enumerate(mapper.nav_goals): # cluster 삭제 필요 (코드 수정 필요)
                 coord = nav_goal.get_descr_point()
                 score = nav_goal.get_score()
                 goal_type = type(nav_goal).__name__
-                print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
+                if goal_type == "Frontier":
+                    print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
         
         # Print graph statistics periodically
         if mapper.pose_graph._step_counter % 50 == 0:

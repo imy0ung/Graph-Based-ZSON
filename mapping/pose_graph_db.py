@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import asdict
 import numpy as np
 
-from .pose_graph import PoseNode, Edge, PoseEdgeType
+from .pose_graph import PoseNode, Edge, PoseEdgeType, FrontierNode
 # 호환성을 위해 Edge를 PoseEdge로도 사용
 PoseEdge = Edge
 
@@ -71,6 +71,19 @@ class PoseGraphDB:
                 last_seen_step INTEGER DEFAULT 0,
                 embedding BLOB,
                 position_covariance TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        
+        # Frontier nodes table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS frontier_nodes (
+                node_id TEXT PRIMARY KEY,
+                x REAL NOT NULL,
+                y REAL NOT NULL,
+                z REAL NOT NULL,
+                is_explored INTEGER DEFAULT 0,
+                semantic_hint TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -137,15 +150,35 @@ class PoseGraphDB:
         transform_json = json.dumps(transform_matrix.tolist()) if transform_matrix is not None else None
         covariance_json = json.dumps(covariance.tolist()) if covariance is not None else None
         
-        # Extract numeric IDs from string IDs (e.g., "pose_123" -> 123)
-        source_id = edge.source if isinstance(edge.source, int) else int(edge.source.split('_')[-1]) if '_' in edge.source else hash(edge.source) % (2**31)
-        target_id = edge.target if isinstance(edge.target, int) else int(edge.target.split('_')[-1]) if '_' in edge.target else hash(edge.target) % (2**31)
+        # Extract numeric IDs from string IDs
+        # Note: Edge class uses 'src' and 'dst', not 'source' and 'target'
+        # IDs are in format "prefix_hexstring" (e.g., "fr_ae273870")
+        def str_to_numeric_id(node_id):
+            if isinstance(node_id, int):
+                return node_id
+            if '_' in node_id:
+                hex_part = node_id.split('_')[-1]
+                try:
+                    # Try to parse as integer first
+                    return int(hex_part)
+                except ValueError:
+                    # If not a decimal integer, try as hex string
+                    try:
+                        return int(hex_part, 16)
+                    except ValueError:
+                        # Fallback to hash
+                        return hash(node_id) % (2**31)
+            else:
+                return hash(node_id) % (2**31)
+        
+        source_id = str_to_numeric_id(edge.src)
+        target_id = str_to_numeric_id(edge.dst)
         
         cursor.execute("""
             INSERT OR REPLACE INTO pose_edges 
             (source_id, target_id, edge_type, transform_matrix, covariance, confidence)
             VALUES (?, ?, ?, ?, ?, ?)
-        """, (source_id, target_id, edge.edge_type, transform_json, covariance_json, confidence))
+        """, (source_id, target_id, edge.kind, transform_json, covariance_json, confidence))
         
         self.conn.commit()
         return cursor.lastrowid
@@ -183,6 +216,71 @@ class PoseGraphDB:
         
         self.conn.commit()
         return obj_node.id
+    
+    def add_frontier_node(self, fr_node: FrontierNode, session_id: Optional[int] = None) -> str:
+        """Add a frontier node to the database."""
+        assert isinstance(fr_node, FrontierNode)
+        
+        cursor = self.conn.cursor()
+        
+        cursor.execute("""
+            INSERT OR REPLACE INTO frontier_nodes 
+            (node_id, x, y, z, is_explored, semantic_hint)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            fr_node.id,
+            float(fr_node.position[0]),
+            float(fr_node.position[1]),
+            float(fr_node.position[2]),
+            1 if fr_node.is_explored else 0,
+            fr_node.semantic_hint
+        ))
+        
+        self.conn.commit()
+        return fr_node.id
+    
+    def remove_frontier_node(self, frontier_id: str) -> None:
+        """Remove a frontier node and its connected edges from the database."""
+        cursor = self.conn.cursor()
+        
+        # Remove edges connected to this frontier node
+        # Extract numeric ID from frontier_id using the same logic as add_edge
+        # IDs are in format "prefix_hexstring" (e.g., "fr_ae273870")
+        def str_to_numeric_id(node_id):
+            if isinstance(node_id, int):
+                return node_id
+            if '_' in node_id:
+                hex_part = node_id.split('_')[-1]
+                try:
+                    # Try to parse as integer first
+                    return int(hex_part)
+                except ValueError:
+                    # If not a decimal integer, try as hex string
+                    try:
+                        return int(hex_part, 16)
+                    except ValueError:
+                        # Fallback to hash
+                        return hash(node_id) % (2**31)
+            else:
+                return hash(node_id) % (2**31)
+        
+        try:
+            numeric_id = str_to_numeric_id(frontier_id)
+            
+            # Remove pose_frontier edges where this frontier is the target
+            # (pose_frontier edges: src=pose_id, dst=frontier_id)
+            cursor.execute("""
+                DELETE FROM pose_edges 
+                WHERE edge_type = 'pose_frontier' 
+                AND target_id = ?
+            """, (numeric_id,))
+        except Exception as e:
+            # If we can't parse the ID, log but continue
+            print(f"[DB] Warning: Could not parse frontier_id {frontier_id} for edge removal: {e}")
+        
+        # Remove the frontier node itself
+        cursor.execute("DELETE FROM frontier_nodes WHERE node_id = ?", (frontier_id,))
+        self.conn.commit()
     
     def get_node(self, node_id: int) -> Optional[PoseNode]:
         """Retrieve a pose node by ID."""

@@ -38,7 +38,8 @@ def setup_blueprint_debug():
                                             "$origin/pose_graph/edges/odometry",
                                             "$origin/pose_graph/edges/loop_closure",
                                             "$origin/pose_graph/objects",
-                                            "$origin/pose_graph/edges/pose_object"], ),
+                                            "$origin/pose_graph/edges/pose_object",
+                                            "$origin/pose_graph/edges/pose_frontier"], ),
             ),
             rrb.Vertical(
                 rrb.Tabs(
@@ -53,6 +54,7 @@ def setup_blueprint_debug():
                                          "$origin/pose_graph/edges/loop_closure",
                                          "$origin/pose_graph/objects",
                                          "$origin/pose_graph/edges/pose_object",
+                                         "$origin/pose_graph/edges/pose_frontier",
                                         ]),
                       rrb.Spatial2DView(origin="map",
                                         name="SimilarityTresholded",
@@ -65,6 +67,7 @@ def setup_blueprint_debug():
                                          "$origin/pose_graph/edges/loop_closure",
                                          "$origin/pose_graph/objects",
                                          "$origin/pose_graph/edges/pose_object",
+                                         "$origin/pose_graph/edges/pose_frontier",
                                         ]),
                       ],
                 ),
@@ -85,8 +88,10 @@ def setup_blueprint_debug():
                                                 "$origin/pose_graph/edges/loop_closure",
                                                 "$origin/pose_graph/objects",
                                                 "$origin/pose_graph/edges/pose_object",
+                                                "$origin/pose_graph/edges/pose_frontier",
                                                 "$origin/explored_objects",
                                                 "$origin/explored_edges/pose_object",
+                                                "$origin/explored_edges/pose_frontier",
                                                 ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Scores",
@@ -99,6 +104,7 @@ def setup_blueprint_debug():
                                                 "$origin/pose_graph/edges/loop_closure",
                                                 "$origin/pose_graph/objects",
                                                 "$origin/pose_graph/edges/pose_object",
+                                                "$origin/pose_graph/edges/pose_frontier",
                                                ]),
                     rrb.Spatial2DView(origin="map",
                                       name="Unexplored",
@@ -108,6 +114,7 @@ def setup_blueprint_debug():
                                                 "$origin/pose_graph/nodes",
                                                 "$origin/pose_graph/edges/odometry",
                                                 "$origin/pose_graph/edges/loop_closure",
+                                                "$origin/pose_graph/edges/pose_frontier",
                                                ]),
                 ),
             ),
@@ -140,6 +147,14 @@ def setup_blueprint_debug():
                                                             rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                                           angle=rr.datatypes.Angle(
                                                                                               rad=-np.pi / 2))))
+    rr.log("map/pose_graph/edges/pose_frontier", rr.Transform3D(translation=np.array([0, 600, 0]),
+                                                                rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
+                                                                                              angle=rr.datatypes.Angle(
+                                                                                                  rad=-np.pi / 2))))
+    rr.log("map/explored_edges/pose_frontier", rr.Transform3D(translation=np.array([0, 600, 0]),
+                                                              rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
+                                                                                            angle=rr.datatypes.Angle(
+                                                                                                rad=-np.pi / 2))))
     rr.log("map/scores", rr.Transform3D(translation=np.array([0, 600, 0]),
                                         rotation=rr.RotationAxisAngle(axis=[0, 0, 1],
                                                                       angle=rr.datatypes.Angle(rad=-np.pi / 2))))
@@ -182,7 +197,9 @@ def setup_blueprint_debug():
         "map/pose_graph/edges/loop_closure",
         "map/pose_graph/objects",
         "map/pose_graph/edges/pose_object",
+        "map/pose_graph/edges/pose_frontier",
         "map/explored_objects",
+        "map/explored_edges/pose_frontier",
     ]:
         rr.log(pose_path,
                rr.Transform3D(translation=np.array([0, 600, 0]),
@@ -212,6 +229,7 @@ def setup_blueprint():
                                          "$origin/pose_graph/edges/loop_closure",
                                          "$origin/pose_graph/objects",
                                          "$origin/pose_graph/edges/pose_object",
+                                         "$origin/pose_graph/edges/pose_frontier",
                                         ]),
                       ],
                 ),
@@ -233,6 +251,8 @@ def setup_blueprint():
                                                 "$origin/frontiers_only",
                                                 "$origin/explored_objects",
                                                 "$origin/explored_edges/pose_object",
+                                                "$origin/pose_graph/edges/pose_frontier",
+                                                "$origin/explored_edges/pose_frontier",
                                                 ]),
                     # rrb.Spatial2DView(origin="map",
                     #                   name="Scores",
@@ -316,7 +336,9 @@ def setup_blueprint():
         "map/pose_graph/edges/loop_closure",
         "map/pose_graph/objects",
         "map/pose_graph/edges/pose_object",
+        "map/pose_graph/edges/pose_frontier",
         "map/explored_edges/pose_object",
+        "map/explored_edges/pose_frontier",
         "map/explored_objects",
     ]:
         rr.log(pose_path,

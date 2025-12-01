@@ -42,6 +42,14 @@ def get_db_stats(db_path: str):
         stats['object_nodes'] = 0
         stats['object_categories'] = {}
     
+    # Frontier nodes
+    try:
+        cursor.execute("SELECT COUNT(*) as count FROM frontier_nodes")
+        stats['frontier_nodes'] = cursor.fetchone()[0]
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet (old schema)
+        stats['frontier_nodes'] = 0
+    
     # Edges
     cursor.execute("SELECT COUNT(*) as count FROM pose_edges")
     stats['edges'] = cursor.fetchone()[0]
@@ -98,6 +106,7 @@ def monitor_db(db_path: str = "pose_graph.db", interval: float = 1.0):
                 print(f"\n📊 STATISTICS")
                 print(f"  Pose Nodes:     {stats['pose_nodes']:>6}")
                 print(f"  Object Nodes:  {stats['object_nodes']:>6}")
+                print(f"  Frontier Nodes: {stats.get('frontier_nodes', 0):>6}")
                 print(f"  Total Edges:   {stats['edges']:>6}")
                 print(f"  Latest Node ID: {stats['latest_node_id']}")
                 
@@ -110,6 +119,11 @@ def monitor_db(db_path: str = "pose_graph.db", interval: float = 1.0):
                     print(f"\n📈 EDGE TYPES")
                     for edge_type, count in sorted(stats['edge_types'].items()):
                         print(f"  {edge_type:20s}: {count:>6}")
+                    
+                    # Show pose-frontier edge count specifically
+                    pose_frontier_count = stats['edge_types'].get('pose_frontier', 0)
+                    if pose_frontier_count > 0:
+                        print(f"\n🔗 POSE-FRONTIER EDGES: {pose_frontier_count}")
                 
                 # Show changes
                 if last_stats is not None:
@@ -117,6 +131,7 @@ def monitor_db(db_path: str = "pose_graph.db", interval: float = 1.0):
                     pose_delta = stats['pose_nodes'] - last_stats['pose_nodes']
                     edge_delta = stats['edges'] - last_stats['edges']
                     obj_delta = stats['object_nodes'] - last_stats['object_nodes']
+                    frontier_delta = stats.get('frontier_nodes', 0) - last_stats.get('frontier_nodes', 0)
                     
                     if pose_delta != 0:
                         print(f"  Pose Nodes:    {pose_delta:>+6}")
@@ -124,6 +139,14 @@ def monitor_db(db_path: str = "pose_graph.db", interval: float = 1.0):
                         print(f"  Edges:         {edge_delta:>+6}")
                     if obj_delta != 0:
                         print(f"  Object Nodes:  {obj_delta:>+6}")
+                    if frontier_delta != 0:
+                        print(f"  Frontier Nodes: {frontier_delta:>+6}")
+                    
+                    # Show pose-frontier edge changes
+                    old_pf_edges = last_stats.get('edge_types', {}).get('pose_frontier', 0)
+                    new_pf_edges = stats.get('edge_types', {}).get('pose_frontier', 0)
+                    if new_pf_edges != old_pf_edges:
+                        print(f"  Pose-Frontier Edges: {new_pf_edges - old_pf_edges:>+6}")
                     
                     # Object category changes
                     if stats.get('object_categories') and last_stats.get('object_categories'):

@@ -682,8 +682,50 @@ class PoseGraph:
             rel_pos=rel_pos,
         )
         self._add_edge(edge)
+        
+        # Save to database if available
+        if self.db:
+            try:
+                self.db.add_frontier_node(fr_node, session_id=self.session_id)
+            except Exception as e:
+                # Silently fail if DB save fails
+                pass
 
         return fr_node
+    
+    def _remove_frontier_node(self, frontier_id: str) -> None:
+        """
+        Remove a frontier node and all its connected edges.
+        
+        Args:
+            frontier_id: ID of frontier node to remove
+        """
+        if frontier_id not in self.nodes:
+            return
+        
+        # Remove edges connected to this frontier
+        edges_to_remove = [
+            edge_id for edge_id, edge in self.edges.items()
+            if edge.dst == frontier_id or edge.src == frontier_id
+        ]
+        for edge_id in edges_to_remove:
+            del self.edges[edge_id]
+        
+        # Remove from frontier_ids list
+        if frontier_id in self.frontier_ids:
+            self.frontier_ids.remove(frontier_id)
+        
+        # Remove node
+        del self.nodes[frontier_id]
+        self._dirty = True
+        
+        # Remove from database if available
+        if self.db:
+            try:
+                self.db.remove_frontier_node(frontier_id)
+            except Exception as e:
+                # Silently fail if DB removal fails
+                pass
 
     def add_region_node(
         self,
@@ -757,6 +799,9 @@ class PoseGraph:
         
         # Log object nodes
         self._log_objects(one_map)
+        
+        # Log frontier nodes
+        self._log_frontiers(one_map)
 
         self._dirty = False
 
@@ -836,6 +881,80 @@ class PoseGraph:
                 rr.log("map/explored_edges/pose_object",
                        rr.LineStrips2D(np.array(pose_object_edges, dtype=np.float32),
                                        colors=[[255, 0, 255]] * len(pose_object_edges)))
+
+    def _log_frontiers(self, one_map) -> None:
+        """Log frontier nodes to rerun (same logic as habitat_test.py)."""
+        if not self.frontier_ids:
+            return
+        
+        # Convert frontier node positions to pixel coordinates (same as object nodes)
+        frontier_coords = []
+        for fr_id in self.frontier_ids:
+            if fr_id not in self.nodes:
+                continue
+            fr_node = self.nodes[fr_id]
+            assert isinstance(fr_node, FrontierNode)
+            px, py = one_map.metric_to_px(fr_node.position[0], fr_node.position[1])
+            # Convert from [y, x] to [x, y] for rerun visualization (same as path and object nodes)
+            frontier_coords.append([py, px])
+        
+        if len(frontier_coords) > 0:
+            # Create small circles for each frontier (same as habitat_test.py)
+            radius = 1.5  # Smaller radius
+            num_points = 32  # Number of points to approximate circle
+            
+            # Generate circle points
+            angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
+            circle_x = np.cos(angles) * radius
+            circle_y = np.sin(angles) * radius
+            
+            # Create LineStrips2D for each frontier
+            circle_strips = []
+            green_color = [0, 255, 0]  # Green color
+            
+            for center in frontier_coords:
+                circle = np.array([
+                    [center[0] + x, center[1] + y] 
+                    for x, y in zip(circle_x, circle_y)
+                ], dtype=np.float32)
+                # Close the circle
+                circle = np.vstack([circle, circle[0:1]])
+                circle_strips.append(circle)
+            
+            # Log all circles (same path as habitat_test.py)
+            rr.log("map/frontiers_only", 
+                   rr.LineStrips2D(circle_strips, 
+                                   colors=[green_color] * len(circle_strips)))
+            
+            # Also log pose-frontier edges (same pattern as pose-object edges)
+            pose_frontier_edges: List[Sequence[Sequence[float]]] = []
+            for edge in self.edges.values():
+                if edge.kind == "pose_frontier":
+                    if edge.src in self.pose_ids and edge.dst in self.frontier_ids:
+                        # Get pose pixel coordinates (recalculate like object edges)
+                        pose_node = self.nodes[edge.src]
+                        assert isinstance(pose_node, PoseNode)
+                        pose_px, pose_py = one_map.metric_to_px(pose_node.x, pose_node.y)
+                        
+                        # Get frontier pixel coordinates
+                        fr_node = self.nodes[edge.dst]
+                        assert isinstance(fr_node, FrontierNode)
+                        fr_px, fr_py = one_map.metric_to_px(fr_node.position[0], fr_node.position[1])
+                        fr_pixel = [fr_py, fr_px]
+                        
+                        segment = [[pose_py, pose_px], fr_pixel]
+                        pose_frontier_edges.append(segment)
+            
+            if pose_frontier_edges:
+                # Green color for pose-frontier edges (same as frontier circles)
+                pose_frontier_edges_array = np.array(pose_frontier_edges, dtype=np.float32)
+                rr.log("map/pose_graph/edges/pose_frontier",
+                       rr.LineStrips2D(pose_frontier_edges_array,
+                                       colors=[[0, 255, 0]] * len(pose_frontier_edges)))
+                # Also log pose-frontier edges on explored map
+                rr.log("map/explored_edges/pose_frontier",
+                       rr.LineStrips2D(pose_frontier_edges_array,
+                                       colors=[[0, 255, 0]] * len(pose_frontier_edges)))
 
     def load_from_database(self, session_id: Optional[int] = None) -> None:
         """Load pose graph from database."""
