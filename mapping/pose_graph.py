@@ -9,9 +9,29 @@ from collections import defaultdict
 import numpy as np
 import rerun as rr
 
+############## utility functions ###############
+""" 
+normalize_embedding
+CLIP 계열 모델의 텍스트/비전 출력을 L2 정규화하는 함수
+Args:
+    x: Optional[np.ndarray]
+Returns:
+    Optional[np.ndarray]
+
+world_to_local_2d
+world 좌표를 pose-local 좌표로 변환하는 함수
+Args:
+    pose_x: float
+    pose_y: float
+    pose_theta: float
+    world_x: float
+    world_y: float
+Returns:
+    np.ndarray
+"""
 # L2 Regularization for embedding
 def normalize_embedding(x: Optional[np.ndarray]) -> Optional[np.ndarray]:
-    if x is None:
+    if x is None: 
         return None
     norm = np.linalg.norm(x)
     if norm < 1e-8:
@@ -21,16 +41,6 @@ def normalize_embedding(x: Optional[np.ndarray]) -> Optional[np.ndarray]:
 
 def world_to_local_2d(pose_x: float, pose_y: float, pose_theta: float,
                       world_x: float, world_y: float) -> np.ndarray:
-    """
-    Convert world coordinates to pose-local coordinates (2D).
-    
-    Args:
-        pose_x, pose_y, pose_theta: Pose position and orientation in world frame
-        world_x, world_y: Point position in world frame
-    
-    Returns:
-        (3,) array: [local_x, local_y, 0] in pose-local frame
-    """
     # Translate to pose origin
     dx = world_x - pose_x
     dy = world_y - pose_y
@@ -42,16 +52,66 @@ def world_to_local_2d(pose_x: float, pose_y: float, pose_theta: float,
     local_y = -dx * sin_theta + dy * cos_theta
     
     return np.array([local_x, local_y, 0.0])
+############## utility functions ###############
 
+############## node&edge 타입 정의 ###############
+"""
+NodeKind
+- pose: 움직이는 로봇의 위치
+- object: 객체
+- frontier: 탐색 경로
+- region: 영역
 
-# 노드 타입 정의
+EdgeKind
+- pose_pose: 움직이는 로봇의 위치와 위치 사이의 관계
+- pose_object: 움직이는 로봇의 위치와 객체 사이의 관계
+- pose_frontier: 움직이는 로봇의 위치와 탐색 경로 사이의 관계
+- pose_region: 움직이는 로봇의 위치와 영역 사이의 관계
+
+PoseEdgeType
+"""
 NodeKind = Literal["pose", "object", "frontier", "region"]
 EdgeKind = Literal["pose_pose", "pose_object", "pose_frontier", "pose_region"]
 
-# 호환성을 위한 타입 별칭
-PoseEdgeType = EdgeKind
+# PoseEdgeType = EdgeKind # 현재는 사용하지 않음
+#################################################
 
-############## node 정의 ###############
+
+############## node class 정의 ###################
+"""
+BaseNode
+- id: 노드 고유 ID
+- kind: 노드 타입
+
+PoseNode
+- x: x 좌표 in world frame
+- y: y 좌표 in world frame
+- theta: 방향 in world frame (radians)
+- step: 시간 index / 프레임 index
+
+ObjectNode
+- label: 관측 라벨
+- position: (3,) world 좌표
+- confidence: 신뢰도
+- embedding: global CLIP embedding 등 (optional)
+- num_observations: 관측 횟수
+- last_seen_step: 마지막 관측 시간 index
+- position_covariance: 칼만 필터 공분산 저장
+
+FrontierNode
+- position: (3,) world 좌표 (frontier 위치)
+- coarse_embedding: local visual context (feature 저장 용도)
+- semantic_hint: optional LLM hint (e.g. "kitchen-like area") (optional)
+- is_explored: 탐색 완료 여부 
+
+RegionNode
+- name: 영역 이름
+- center: (3,) region 중심 world 좌표
+- embedding: region-level aggregated embedding (feature 저장 용도) (optional)
+- member_object_ids: 영역 내 객체 ID 목록
+- member_frontier_ids: 영역 내 Frontier ID 목록
+"""
+
 @dataclass
 class BaseNode:
     id: str
@@ -73,7 +133,6 @@ class PoseNode(BaseNode):
             return int(self.id.split('_')[-1])
         except:
             return hash(self.id) % (2**31)
-
 
 @dataclass
 class ObjectNode(BaseNode):
@@ -103,8 +162,17 @@ class RegionNode(BaseNode):
     member_object_ids: List[str] = field(default_factory=list)
     member_frontier_ids: List[str] = field(default_factory=list)
 
-############## node 정의 ###############
+#################################################
 
+############## edge class 정의 ###################
+"""
+Edge
+- id: 엣지 고유 ID
+- kind: 엣지 타입
+- src: 소스 노드 ID
+- dst: 목적지 노드 ID
+- rel_pos: 소스 기준 목적지 상대 위치 (3,) - 2D 평면에서 사용
+"""
 @dataclass
 class Edge:
     id: str
@@ -116,7 +184,6 @@ class Edge:
     # 호환성을 위한 속성
     @property
     def source(self) -> int:
-        """호환성을 위한 source (node_id 추출)"""
         try:
             return int(self.src.split('_')[-1])
         except:
@@ -124,7 +191,6 @@ class Edge:
     
     @property
     def target(self) -> int:
-        """호환성을 위한 target (node_id 추출)"""
         try:
             return int(self.dst.split('_')[-1])
         except:
@@ -132,13 +198,53 @@ class Edge:
     
     @property
     def edge_type(self) -> EdgeKind:
-        """호환성을 위한 edge_type"""
         return self.kind
+#################################################
 
+############## Pose graph 정의 ###################
+"""
+PoseGraph
+Rerun 로깅 기능과 데이터베이스 저장 기능을 포함한 최소 형태의 포즈 그래프 컨테이너
 
+1. 노드 추가 메서드
+add_pose(x,y,theta): 움직이는 로봇의 위치 노드 추가
+add_object_node: 객체 노드 추가
+add_object_nodes_batch : 다중 객체가 탐지되었을 때, add_object_node를 여러번 호출하는 대신 한 번에 처리하는 함수.
+add_frontier_node: 탐색 경로 노드 추가
+add_region_node: 영역 노드 추가 (구현 예정)
+
+2. 객체 매칭 및 업데이트
+find_nearby_objects: Mahalanobis 거리를 통해서 같은 라벨을 가진 근처 객체 검색
+update_object_node: Kalman 필터 기반 객체 업데이트, 객체 중심점 보정 수행, 다중 객체 confidence 평균 계산
+_predict_object_position: Kalman 필터 기반 객체 위치 예측
+_calculate_mahalanobis_distance: 공분산 & Mahalanobis 거리 계산
+
+3. 노드 제거
+_remove_frontier_node: 탐색 경로 노드 제거, navigator.py에서 방문시 제거
+_remove_object_node: 객체 노드 제거
+_remove_low_confidence_objects: 신뢰도 낮은 객체 제거 (현재 미사용)
+
+4. 시각화
+log_to_rerun: 전체 그래프를 Rerun으로 로깅
+_log_edges: 엣지 로깅
+_log_objects: 객체 로깅
+_log_frontiers: 프런티어 로깅
+_log_regions: 영역 로깅 (추후 구현 예정)
+
+5. 유틸리티 및 통계
+get_statistics: 그래프 통계 정보 반환
+get_trajectory_length: 포즈 간 엣지로 총 이동 거리 계산 (미사용)
+export_to_file: JSON으로 내보내기
+load_from_database : DB에서 로드 (구현 예정)
+
+6. 내부 헬퍼 메서드
+_new_id: UUID 기반 고유 ID 생성
+_get_grid_cell: 공간 인덱싱용 그리드 셀 계산
+_get_nearby_grid_cells: 반경 내 그리드 셀 검색
+_add_node(),_add_edge(): 내부 노드/엣지 추가
+_angle_diff: 각도 차이 계산(정규화)
+"""
 class PoseGraph:
-    """Minimal pose-graph container with rerun logging helpers and database storage."""
-
     def __init__(self,
                  min_translation: float = 0.02,
                  min_rotation: float = np.deg2rad(1.0),
@@ -175,17 +281,17 @@ class PoseGraph:
         
         self._step_counter = 0
 
-    def _new_id(self, prefix: str) -> str:
+    def _new_id(self, prefix: str) -> str: # UUID 기반 고유 ID 생성 
         """Generate new unique ID."""
         return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
-    def _get_grid_cell(self, x: float, y: float) -> tuple:
+    def _get_grid_cell(self, x: float, y: float) -> tuple: # 공간 인덱싱 용, 1m x 1m 그리드 셀 기준 좌표 계산
         """Get grid cell coordinates for spatial indexing."""
         cell_x = int(x / self._grid_cell_size)
         cell_y = int(y / self._grid_cell_size)
         return (cell_x, cell_y)
     
-    def _get_nearby_grid_cells(self, x: float, y: float, radius: float) -> List[tuple]:
+    def _get_nearby_grid_cells(self, x: float, y: float, radius: float) -> List[tuple]: # x,y를 중심으로 radius 반경 내 그리드 셀 검색
         """Get nearby grid cells within radius."""
         center_cell = self._get_grid_cell(x, y)
         cells = []
@@ -195,7 +301,7 @@ class PoseGraph:
                 cells.append((center_cell[0] + dx, center_cell[1] + dy))
         return cells
     
-    def _add_node(self, node: BaseNode):
+    def _add_node(self, node: BaseNode): # 내부 노드 추가
         """Add node to graph."""
         self.nodes[node.id] = node
         if node.kind == "pose":
@@ -212,7 +318,7 @@ class PoseGraph:
         elif node.kind == "region":
             self.region_ids.append(node.id)
 
-    def _add_edge(self, edge: Edge):
+    def _add_edge(self, edge: Edge): # 내부 엣지 추가
         """Add edge to graph."""
         self.edges[edge.id] = edge
         self._dirty = True
@@ -226,11 +332,11 @@ class PoseGraph:
                 pass
 
     @staticmethod
-    def _angle_diff(rad_a: float, rad_b: float) -> float:
+    def _angle_diff(rad_a: float, rad_b: float) -> float: # 각도 차이 계산(정규화)
         diff = rad_a - rad_b
         return (diff + np.pi) % (2 * np.pi) - np.pi
 
-    def add_pose(self, x: float, y: float, theta: float) -> int:
+    def add_pose(self, x: float, y: float, theta: float) -> int: # 움직이는 로봇의 위치 노드 추가
         """Add a pose node if it is sufficiently different from the latest one."""
         # 기존 pose 노드와 비교
         if self.pose_ids:
@@ -288,15 +394,7 @@ class PoseGraph:
 
     def _predict_object_position(self, obj_node: ObjectNode, steps_since_last_seen: int) -> np.ndarray:
         """
-        Predict object position using Kalman filter prediction step.
-        For static objects, position remains constant (only uncertainty increases).
-        
-        Args:
-            obj_node: Object node with Kalman filter state
-            steps_since_last_seen: Number of steps since last observation
-        
-        Returns:
-            Predicted position (2,) for x, y (same as current position for static objects)
+        객체 위치 예측 상태 추정값 : 정적 객체이므로, 위치만 반환
         """
         # Constant position model (static objects)
         predicted_pos = obj_node.position[:2]
@@ -309,8 +407,8 @@ class PoseGraph:
         covariance: np.ndarray,
     ) -> float:
         """
-        Calculate Mahalanobis distance between observed and predicted position.
-        
+        관측된 값이랑 예측된 값 사이의 mahalanobis 거리 계산
+
         Args:
             observed_pos: (2,) observed position
             predicted_pos: (2,) predicted position
@@ -337,8 +435,8 @@ class PoseGraph:
         mahalanobis_threshold: float = 3.0,  # 3-sigma threshold
     ) -> Optional[ObjectNode]:
         """
-        Find nearby object with the same label using Kalman filter-based matching.
-        
+        칼만 필터 매칭을 사용해서 객체 근처의 같은 라벨을 가지는 객체가 있는 조사
+        mahalanobis threshold를 설정해서, 근처에 같은 라벨을 가지는 객체 있는지 조사.
         Args:
             label: Object label to match
             position_w: World position (3,)
@@ -411,7 +509,7 @@ class PoseGraph:
         observation_noise: float = 0.1,  # Observation noise covariance
     ) -> ObjectNode:
         """
-        Update existing object node with new observation using Kalman filter update.
+        칼만 필터 업데이트 단계 : 예측된 위치와 관측된 위치 사이의 차이를 줄이기 위해 칼만 필터 업데이트 단계를 수행하는 함수.
         
         Args:
             obj_node: Existing object node to update
@@ -508,6 +606,9 @@ class PoseGraph:
         distance_threshold: float = 3.0,
     ) -> ObjectNode:
         """
+        객체 노드를 추가하거나, 근처에 발견된 객체의 중심점을 이용해 칼만필터 업데이트
+        find_nearby_objects 함수를 통해 근처에 같은 라벨이 가지는 노드가 있으면 하나로 통합. 통합하는 과정에서도 칼만필터 기반 중심점 보정 수행
+        근처에 발견된 객체가 없다면 새로운 객체 노드에 추가.
         Add object node or update existing one if nearby object found.
         
         Args:
@@ -607,6 +708,7 @@ class PoseGraph:
         mahalanobis_threshold: float = 3.0,
     ) -> List[Optional[ObjectNode]]:
         """
+        navigator.py에서 직접적으로 사용하는 함수 : 한 프레임에서 여러 객체를 처리하는 용도.
         Add multiple object nodes using greedy matching (sequential processing).
         
         Args:
@@ -646,7 +748,7 @@ class PoseGraph:
         
         return results
 
-    def add_frontier_node(
+    def add_frontier_node( # 프런티어 노드를 추가하는 함수
         self,
         pose_id: str,
         position_w: np.ndarray,
@@ -693,7 +795,7 @@ class PoseGraph:
 
         return fr_node
     
-    def _remove_frontier_node(self, frontier_id: str) -> None:
+    def _remove_frontier_node(self, frontier_id: str) -> None: # 프런티어를 제거하는 내부 함수
         """
         Remove a frontier node and all its connected edges.
         
@@ -727,7 +829,7 @@ class PoseGraph:
                 # Silently fail if DB removal fails
                 pass
 
-    def add_region_node(
+    def add_region_node( # 영역 노드를 추가하는 함수 (수정 필요)
         self,
         name: str,
         center_w: np.ndarray,
@@ -750,7 +852,7 @@ class PoseGraph:
         return region_node
 
 ## frontier to region 
-    def promote_frontier_to_region(
+    def promote_frontier_to_region( # frontier을 region 노드로 승격시키는 함수 (수정 필요)
         self,
         frontier_id: str,
         name: str,
@@ -777,7 +879,7 @@ class PoseGraph:
         )
         return region_node
 
-    def log_to_rerun(self, one_map) -> None:
+    def log_to_rerun(self, one_map) -> None: # rerun 로깅
         """Log the current pose graph into rerun aligned with the map space."""
         if not self._dirty or not self.pose_ids:
             return
@@ -805,7 +907,7 @@ class PoseGraph:
 
         self._dirty = False
 
-    def _log_edges(self, one_map, node_pixels: np.ndarray) -> None:
+    def _log_edges(self, one_map, node_pixels: np.ndarray) -> None: # 엣지 로깅
         """Log edges to rerun."""
         if node_pixels.size == 0:
             return
@@ -827,9 +929,8 @@ class PoseGraph:
             rr.log("map/pose_graph/edges/odometry",
                    rr.LineStrips2D(np.array(pose_pose_edges, dtype=np.float32),
                                    colors=[[51, 153, 255]] * len(pose_pose_edges)))
-    
-    def _log_objects(self, one_map) -> None:
-        """Log object nodes to rerun."""
+     
+    def _log_objects(self, one_map) -> None: # 객체 로깅
         if not self.object_ids:
             return
         
@@ -882,7 +983,7 @@ class PoseGraph:
                        rr.LineStrips2D(np.array(pose_object_edges, dtype=np.float32),
                                        colors=[[255, 0, 255]] * len(pose_object_edges)))
 
-    def _log_frontiers(self, one_map) -> None:
+    def _log_frontiers(self, one_map) -> None: # 프런티어 로깅
         """Log frontier nodes to rerun (same logic as habitat_test.py)."""
         if not self.frontier_ids:
             return
@@ -926,37 +1027,38 @@ class PoseGraph:
                    rr.LineStrips2D(circle_strips, 
                                    colors=[green_color] * len(circle_strips)))
             
-            # Also log pose-frontier edges (same pattern as pose-object edges)
-            pose_frontier_edges: List[Sequence[Sequence[float]]] = []
-            for edge in self.edges.values():
-                if edge.kind == "pose_frontier":
-                    if edge.src in self.pose_ids and edge.dst in self.frontier_ids:
-                        # Get pose pixel coordinates (recalculate like object edges)
-                        pose_node = self.nodes[edge.src]
-                        assert isinstance(pose_node, PoseNode)
-                        pose_px, pose_py = one_map.metric_to_px(pose_node.x, pose_node.y)
+            #### frontier-pose edge visualization option ####
+            # # Also log pose-frontier edges (same pattern as pose-object edges)
+            # pose_frontier_edges: List[Sequence[Sequence[float]]] = []
+            # for edge in self.edges.values():
+            #     if edge.kind == "pose_frontier":
+            #         if edge.src in self.pose_ids and edge.dst in self.frontier_ids:
+            #             # Get pose pixel coordinates (recalculate like object edges)
+            #             pose_node = self.nodes[edge.src]
+            #             assert isinstance(pose_node, PoseNode)
+            #             pose_px, pose_py = one_map.metric_to_px(pose_node.x, pose_node.y)
                         
-                        # Get frontier pixel coordinates
-                        fr_node = self.nodes[edge.dst]
-                        assert isinstance(fr_node, FrontierNode)
-                        fr_px, fr_py = one_map.metric_to_px(fr_node.position[0], fr_node.position[1])
-                        fr_pixel = [fr_py, fr_px]
+            #             # Get frontier pixel coordinates
+            #             fr_node = self.nodes[edge.dst]
+            #             assert isinstance(fr_node, FrontierNode)
+            #             fr_px, fr_py = one_map.metric_to_px(fr_node.position[0], fr_node.position[1])
+            #             fr_pixel = [fr_py, fr_px]
                         
-                        segment = [[pose_py, pose_px], fr_pixel]
-                        pose_frontier_edges.append(segment)
+            #             segment = [[pose_py, pose_px], fr_pixel]
+            #             pose_frontier_edges.append(segment)
             
-            if pose_frontier_edges:
-                # Green color for pose-frontier edges (same as frontier circles)
-                pose_frontier_edges_array = np.array(pose_frontier_edges, dtype=np.float32)
-                rr.log("map/pose_graph/edges/pose_frontier",
-                       rr.LineStrips2D(pose_frontier_edges_array,
-                                       colors=[[0, 255, 0]] * len(pose_frontier_edges)))
-                # Also log pose-frontier edges on explored map
-                rr.log("map/explored_edges/pose_frontier",
-                       rr.LineStrips2D(pose_frontier_edges_array,
-                                       colors=[[0, 255, 0]] * len(pose_frontier_edges)))
-
-    def load_from_database(self, session_id: Optional[int] = None) -> None:
+            # if pose_frontier_edges:
+            #     # Green color for pose-frontier edges (same as frontier circles)
+            #     pose_frontier_edges_array = np.array(pose_frontier_edges, dtype=np.float32)
+            #     rr.log("map/pose_graph/edges/pose_frontier",
+            #            rr.LineStrips2D(pose_frontier_edges_array,
+            #                            colors=[[0, 255, 0]] * len(pose_frontier_edges)))
+            #     # Also log pose-frontier edges on explored map
+            #     rr.log("map/explored_edges/pose_frontier",
+            #            rr.LineStrips2D(pose_frontier_edges_array,
+            #                            colors=[[0, 255, 0]] * len(pose_frontier_edges)))
+            ###################################################
+    def load_from_database(self, session_id: Optional[int] = None) -> None: # 데이터베이스에서 로드가 되는 기능 (구현 예정)
         """Load pose graph from database."""
         if not self.db:
             return
@@ -965,7 +1067,7 @@ class PoseGraph:
         # 기존 형식과 새 형식 간 변환 필요
         self._dirty = True
 
-    def get_trajectory_length(self) -> float:
+    def get_trajectory_length(self) -> float: # 로봇의 총 이동 거리 계산 (디버깅, 구체적으로 쓰이진 않음)
         """Calculate total trajectory length from pose_pose edges."""
         total_length = 0.0
         for edge in self.edges.values():
@@ -978,31 +1080,7 @@ class PoseGraph:
                         total_length += length
         return total_length
 
-    def get_trusted_objects(
-        self,
-        min_observations: int = 2,
-        min_confidence: float = 0.3,
-    ) -> List[ObjectNode]:
-        """
-        Get objects that meet minimum observation and confidence criteria.
-        
-        Args:
-            min_observations: Minimum number of observations required
-            min_confidence: Minimum average confidence required
-        
-        Returns:
-            List of trusted ObjectNode objects
-        """
-        trusted = []
-        for obj_id in self.object_ids:
-            obj_node = self.nodes[obj_id]
-            assert isinstance(obj_node, ObjectNode)
-            if (obj_node.num_observations >= min_observations and
-                obj_node.confidence >= min_confidence):
-                trusted.append(obj_node)
-        return trusted
-    
-    def _remove_object_node(self, obj_id: str) -> None:
+    def _remove_object_node(self, obj_id: str) -> None: # object 노드 삭제 함수
         """
         Remove an object node and all its connected edges.
         
@@ -1040,36 +1118,7 @@ class PoseGraph:
         del self.nodes[obj_id]
         self._dirty = True
     
-    def remove_low_confidence_objects(
-        self,
-        min_observations: int = 2,
-        min_confidence: float = 0.3,
-    ) -> int:
-        """
-        Remove objects that don't meet minimum criteria (false positives).
-        
-        Args:
-            min_observations: Minimum number of observations required
-            min_confidence: Minimum average confidence required
-        
-        Returns:
-            Number of objects removed
-        """
-        to_remove = []
-        for obj_id in self.object_ids:
-            obj_node = self.nodes[obj_id]
-            assert isinstance(obj_node, ObjectNode)
-            if (obj_node.num_observations < min_observations or
-                obj_node.confidence < min_confidence):
-                to_remove.append(obj_id)
-        
-        # Remove objects using helper method
-        for obj_id in to_remove:
-            self._remove_object_node(obj_id)
-        
-        return len(to_remove)
-    
-    def get_statistics(self) -> dict:
+    def get_statistics(self) -> dict: # 그래프 통계 정보 반환
         """Get pose graph statistics."""
         stats = {
             'node_count': len(self.nodes),
@@ -1091,7 +1140,7 @@ class PoseGraph:
         
         return stats
 
-    def export_to_file(self, filepath: str) -> None:
+    def export_to_file(self, filepath: str) -> None: # 그래프를 JSON 파일로 내보내는 함수
         """Export pose graph to JSON file."""
         import json
         
@@ -1144,7 +1193,7 @@ class PoseGraph:
         with open(filepath, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def close(self) -> None:
+    def close(self) -> None: # 데이터베이스 연결 닫기 (구현 예정)
         """Close database connection."""
         if self.db:
             self.db.close()

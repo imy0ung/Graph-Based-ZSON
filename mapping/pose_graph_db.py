@@ -10,7 +10,7 @@ from typing import List, Optional, Tuple, Dict, Any
 from dataclasses import asdict
 import numpy as np
 
-from .pose_graph import PoseNode, Edge, PoseEdgeType, FrontierNode
+from .pose_graph import PoseNode, Edge, EdgeKind, FrontierNode
 # 호환성을 위해 Edge를 PoseEdge로도 사용
 PoseEdge = Edge
 
@@ -315,7 +315,7 @@ class PoseGraphDB:
             ))
         return nodes
     
-    def get_edges_by_type(self, edge_type: PoseEdgeType) -> List[PoseEdge]:
+    def get_edges_by_type(self, edge_type: EdgeKind) -> List[PoseEdge]:
         """Get all edges of a specific type."""
         cursor = self.conn.cursor()
         cursor.execute("SELECT * FROM pose_edges WHERE edge_type = ?", (edge_type,))
