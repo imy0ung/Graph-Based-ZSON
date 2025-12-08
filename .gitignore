@@ -51,5 +51,7 @@ Thumbs.db
 # 캐시
 .cache/
 
+.db/
+
 frontier_exploration/
 vlfm/

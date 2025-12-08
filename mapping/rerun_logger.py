@@ -371,12 +371,16 @@ class RerunLogger:
         )
 
     def log_map(self):
-        confidences = self.mapper.get_confidence_map()
-        similarities = (self.mapper.get_map() + 1.0) / 2.0
+        # Use explored_area instead of confidence_map
+        explored_area = self.mapper.get_confidence_map()  # This now returns explored_area
+        # similarities is no longer available (get_map returns None)
+        # Use explored_area directly for visualization
+        similarities = None
 
         explored = (self.mapper.one_map.navigable_map == 1).astype(np.float32) * 0.1
-        explored[confidences > 0] = 0.5
-        explored[self.mapper.one_map.fully_explored_map] = 1.0
+        explored[explored_area > 0] = 0.5
+        # Removed fully_explored_map visualization to avoid confidence_map-style red regions
+        # explored[self.mapper.one_map.fully_explored_map] = 1.0
         explored[self.mapper.one_map.navigable_map == 0] = 0
 
         # frontiers = np.zeros((confidences.shape[0], confidences.shape[1]), dtype=np.float32)
@@ -387,7 +391,8 @@ class RerunLogger:
 
         # log_map_rerun(self.mapper.value_mapper.navigable_map, path="map/traversable")
         log_map_rerun(explored, path="map/explored")
-        log_map_rerun(similarities[0], path="map/similarity")
+        # Similarities are no longer available (feature_map removed)
+        # log_map_rerun(similarities[0], path="map/similarity")
         # log_map_rerun(confidences, path="map/confidence")
 
     def log_pos(self, x, y):

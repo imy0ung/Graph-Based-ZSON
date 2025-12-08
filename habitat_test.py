@@ -55,11 +55,16 @@ if __name__ == "__main__":
     detector = YOLOWorldDetector(0.8)
     mapper = Navigator(model, detector, config)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
-    mapper.set_query(["A Couch"])  # Target object for navigation
+    
+    # Multi-object navigation: list of objects to find
+    #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
+    qs = ["couch"]
+    mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration()
     backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
 
     hfov = 90
@@ -127,7 +132,6 @@ if __name__ == "__main__":
     # Main simulation loop
     initial_sequence = ["turn_left"] * 28 * 2  # + ["move_forward"]*10
     # initial_sequence = ["turn_left"]*5 + ["move_forward"]*5
-    qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
     running = True
     autonomous = True
     controller = Controllers.HabitatController(sim, config.controller)
@@ -258,14 +262,18 @@ if __name__ == "__main__":
                            rr.LineStrips2D(circle_strips, 
                                          colors=[green_color] * len(circle_strips)))
         if obj_found:
+            print(f"Object '{mapper.query_text[0]}' found! Moving to next object...")
             if len(qs) > 0:
-                mapper.set_query([qs[0]])
+                next_obj = qs[0]
                 qs.pop(0)
+                mapper.set_query([next_obj])
+                print(f"Now searching for: {next_obj}")
             else:
                 # All objects found, exit
                 print("All target objects found. Exiting...")
                 running = False
                 break
+            # Continue to next iteration to start searching for new object
             continue
         
         # Exit if no more queries and no path

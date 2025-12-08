@@ -69,8 +69,6 @@ class FusionType(Enum):
 
 
 class OneMap:
-    feature_map: torch.Tensor  # map where first dimension is x direction, second dimension is y, and last direction is
-    # feature_dim
     obstacle_map: torch.Tensor  # map where first dimension is x direction, second dimension is y, and last direction is
     # obstacle likelihood
     navigable_map: np.ndarray  # binary traversability map where first dimension is x direction, second dimension is y
@@ -79,9 +77,7 @@ class OneMap:
     explored_area: np.ndarray  # binary explored area map (VLFM style: any observation counts as explored)
     checked_map: np.ndarray  # binary checked map where first dimension is x direction, second dimension is y,
     # can be reset
-    confidence_map: torch.Tensor
     checked_conf_map: torch.Tensor
-    updated_mask: torch.Tensor  # tracks which cells have been updated, for lazy similarity computation
 
     def __init__(self,
                  feature_dim: int,
@@ -111,11 +107,11 @@ class OneMap:
                                                                      dtype=torch.int32).to("cuda")
         self.size = config.size
         self.cell_size = self.size / self.n_cells
-        self.feature_dim = feature_dim
-        self.feature_map = torch.zeros((self.n_cells, self.n_cells, feature_dim), dtype=torch.float32)
-        self.feature_map = self.feature_map.to(self.map_device)
+        self.feature_dim = feature_dim  # Keep for compatibility, but not used for storage
 
-        self.obstacle_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
+        self.obstacle_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
+        # 누적 신뢰도를 별도로 유지해 가중 평균을 수행
+        self.obstacle_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
         self.agent_radius = config.agent_radius
         col_kernel_size = self.n_cells / self.size * self.agent_radius
         col_kernel_size = int(col_kernel_size) + (int(col_kernel_size) % 2 == 0)
@@ -127,12 +123,8 @@ class OneMap:
         self.explored_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
 
-        self.confidence_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
-        self.confidence_map = self.confidence_map.to(self.map_device)
         self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
         self.checked_conf_map = self.checked_conf_map.to(self.map_device)
-
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
 
         self.fx = None
         self.fy = None
@@ -150,9 +142,7 @@ class OneMap:
         self.kernel_ids_x, self.kernel_ids_y = torch.meshgrid(self.kernel_ids, self.kernel_ids)
         self.kernel_ids_x = self.kernel_ids_x.unsqueeze(0)
         self.kernel_ids_y = self.kernel_ids_y.unsqueeze(0)
-        print("ValueMap initialized. The map contains {} cells, each storing {} features. The resulting"
-              " size is {} Mb".format(self.n_cells ** 2, feature_dim, self.feature_map.element_size() *
-                                      self.feature_map.nelement() / 1024 / 1024))
+        print("OneMap initialized. The map contains {} cells. Obstacle and navigable maps are maintained for navigation.".format(self.n_cells ** 2))
 
         self.obstacle_map_threshold = config.obstacle_map_threshold
         self.fully_explored_threshold = config.fully_explored_threshold
@@ -170,12 +160,9 @@ class OneMap:
         self._iters = 0
 
     def reset(self):
-        # Reset value map
-        self.feature_map = torch.zeros((self.n_cells, self.n_cells, self.feature_dim), dtype=torch.float32).to(
-            self.map_device)
-
         # Reset obstacle map
         self.obstacle_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
+        self.obstacle_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
 
         # Reset navigable map
         self.navigable_map = np.ones((self.n_cells, self.n_cells), dtype=bool)
@@ -190,25 +177,17 @@ class OneMap:
         # Reset checked map
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
 
-        # Reset confidence map
-        self.confidence_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
-
         # Reset checked confidence map
         self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
-
-        # Reset updated mask
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
 
         # Reset iteration counter
         self._iters = 0
         self.agent_height_0 = None
 
-    def reset_updated_mask(self):
-        self.updated_mask = torch.zeros((self.n_cells, self.n_cells), dtype=torch.bool).to(self.map_device)
 
     def reset_checked_map(self):
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
-        self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
+        self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32).to(self.map_device)
 
     def set_camera_matrix(self,
                           camera_matrix: np.ndarray
@@ -244,69 +223,77 @@ class OneMap:
         if self.agent_height_0 is None:
             self.agent_height_0 = tf_camera_to_episodic[2, 3] / tf_camera_to_episodic[3, 3]
         if len(values.shape) == 1 or (values.shape[-1] == 1 and values.shape[-2] == 1):
-            confidences_mapped, values_mapped = self.project_single(values, depth,
-                                                                    tf_camera_to_episodic, self.fx, self.fy,
-                                                                    self.cx, self.cy)
+            # project_single is not implemented, skip for now
+            raise NotImplementedError("project_single is not implemented")
         elif len(values.shape) == 3:
             values = values.permute(1, 2, 0)  # feature_dim last for convenience
-            (confidences_mapped, values_mapped,
+            (observed_cell_indices,
              obstacle_mapped, obstcl_confidence_mapped) = self.project_dense(values, torch.Tensor(depth).to("cuda"),
                                                                              torch.tensor(tf_camera_to_episodic),
                                                                              self.fx, self.fy,
                                                                              self.cx, self.cy)
         else:
             raise Exception("Provided Value observation of unsupported format")
-        self.fuse_maps(confidences_mapped, values_mapped, obstacle_mapped, obstcl_confidence_mapped, artifical_obstacles)
+        self.fuse_maps(observed_cell_indices, obstacle_mapped, obstcl_confidence_mapped, artifical_obstacles)
 
     def fuse_maps(self,
-                  confidences_mapped: torch.Tensor,
-                  values_mapped: torch.Tensor,
+                  observed_cell_indices: torch.Tensor,
                   obstacle_mapped: torch.Tensor,
                   obstcl_confidence_mapped: torch.Tensor,
                   artifical_obstacles: Optional[List[Tuple[float]]] = None
                   ) -> None:
         """
-        Fuses the mapped values into the value map using the confidence estimates and tracked confidences
-        This function takes in sparse tensors of confidences and values, and fuses them into the map, only updating
-        the cells that have been updated.
-        :param confidences_mapped: torch: sparse COO tensor of confidences
-        :param values_mapped: torchL sparse COO tensor of values
+        Fuses the mapped observations into the map.
+        Updates obstacle map and explored area based on observed cells.
+        :param observed_cell_indices: torch tensor of shape (2, N) containing (x, y) indices of observed cells
+        :param obstacle_mapped: torch sparse COO tensor of obstacle values
+        :param obstcl_confidence_mapped: torch sparse COO tensor of obstacle confidences
+        :param artifical_obstacles: Optional list of artificial obstacle positions
         :return:
         """
         if self.fusion_type == FusionType.EMA:
-            indices = confidences_mapped.indices()
             indices_obstacle = obstacle_mapped.indices()
-            confs_new = confidences_mapped.values().data.squeeze()
-            confs_old = self.confidence_map[indices[0], indices[1]]
+            
+            # Update explored_area directly from observed cells (VLFM style: any observation counts as explored)
+            if observed_cell_indices.shape[1] > 0:
+                obs_indices_np = observed_cell_indices.cpu().numpy()
+                # Ensure indices are within bounds and convert to integer type
+                valid_mask = (obs_indices_np[0] >= 0) & (obs_indices_np[0] < self.n_cells) & \
+                             (obs_indices_np[1] >= 0) & (obs_indices_np[1] < self.n_cells)
+                if valid_mask.any():
+                    valid_indices = obs_indices_np[:, valid_mask].astype(np.int32)  # Convert to integer type
+                    valid_indices_torch = torch.from_numpy(valid_indices).to(self.map_device)
+                    # Mark as explored
+                    self.explored_area[valid_indices[0], valid_indices[1]] = True
+                    # Update checked_conf_map (accumulate confidence for checked_map calculation)
+                    # 관측 신뢰도를 누적 (현재 관측값에 대한 명시적 신뢰도가 없으므로 1.0 가중을 합산)
+                    self.checked_conf_map[valid_indices_torch[0].long(), valid_indices_torch[1].long()] += 1.0
 
-            confs_old_obs = self.confidence_map[indices_obstacle[0], indices_obstacle[1]]
+            # Obstacle Map update (using EMA fusion)
+            if indices_obstacle.shape[1] > 0:
+                # 신뢰도 누적 기반 가중 평균
+                confs_new = obstcl_confidence_mapped.values().data.squeeze().to(self.map_device)
+                obstacle_values = obstacle_mapped.values().data.squeeze().to(self.map_device)
 
-            confidence_denominator = confs_new + confs_old
-            weight_1 = torch.nan_to_num(confs_old / confidence_denominator)
-            weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
+                # 1D 보장
+                if len(confs_new.shape) > 1:
+                    confs_new = confs_new.squeeze()
+                if len(obstacle_values.shape) > 1:
+                    obstacle_values = obstacle_values.squeeze()
 
-            self.updated_mask[indices[0], indices[1]] = True
+                indices_0 = indices_obstacle[0].long().to(self.map_device)
+                indices_1 = indices_obstacle[1].long().to(self.map_device)
 
-            self.feature_map[indices[0], indices[1]] = self.feature_map[indices[0], indices[1]] * weight_1.unsqueeze(-1) + \
-                                                       values_mapped.values().data * weight_2.unsqueeze(-1)
+                confs_old = self.obstacle_conf_map[indices_0, indices_1]
+                conf_den = confs_old + confs_new
+                weight_old = torch.nan_to_num(confs_old / conf_den, nan=0.0)
+                weight_new = torch.nan_to_num(confs_new / conf_den, nan=0.0)
 
-            self.confidence_map[indices[0], indices[1]] = confidence_denominator
-
-            # we also need to update the checked confidence
-            confs_old_checked = self.checked_conf_map[indices[0], indices[1]]
-            confidence_denominator_checked = confs_new + confs_old_checked
-            self.checked_conf_map[indices[0], indices[1]] = confidence_denominator_checked
-
-            # Obstacle Map update
-            confs_new = obstcl_confidence_mapped.values().data.squeeze()
-            confidence_denominator = confs_new + confs_old_obs
-            weight_1 = torch.nan_to_num(confs_old_obs / confidence_denominator)
-            weight_2 = torch.nan_to_num(confs_new / confidence_denominator)
-
-            self.obstacle_map[indices_obstacle[0], indices_obstacle[1]] = self.obstacle_map[
-                                                                              indices_obstacle[0], indices_obstacle[
-                                                                                  1]] * weight_1 + \
-                                                                          obstacle_mapped.values().data.squeeze() * weight_2
+                self.obstacle_map[indices_0, indices_1] = (
+                    self.obstacle_map[indices_0, indices_1] * weight_old +
+                    obstacle_values * weight_new
+                )
+                self.obstacle_conf_map[indices_0, indices_1] = conf_den
 
             self.occluded_map = (self.obstacle_map > self.obstacle_map_threshold).cpu().numpy()
             if artifical_obstacles is not None:
@@ -315,18 +302,14 @@ class OneMap:
             self.navigable_map = 1 - cv2.dilate((self.occluded_map).astype(np.uint8),
                                                 self.navigable_kernel, iterations=1).astype(bool)
 
-
-            self.fully_explored_map = (np.nan_to_num(1.0 / self.confidence_map.cpu().numpy())
-                                       < self.fully_explored_threshold)
-
-            # Update explored_area (VLFM style: any observation counts as explored)
-            # This is the classical frontier definition: explored (confidence > 0) vs unexplored (confidence == 0)
-            self.explored_area = (self.confidence_map > 0).cpu().numpy()
             # Only mark navigable areas as explored
             self.explored_area = self.explored_area & self.navigable_map
 
-            self.checked_map = (np.nan_to_num(1.0 / self.checked_conf_map.cpu().numpy())
-                                < self.checked_map_threshold)
+            # Update fully_explored_map based on checked_map threshold
+            # 신뢰도 기반 판정: 1 / conf < threshold 형태로 복원
+            checked_conf_np = self.checked_conf_map.cpu().numpy()
+            self.checked_map = (np.nan_to_num(1.0 / checked_conf_np) < self.checked_map_threshold)
+            self.fully_explored_map = self.checked_map.copy()
 
     @torch.no_grad()
     # @torch.compile
@@ -346,7 +329,10 @@ class OneMap:
         :param fy:
         :param cx:
         :param cy:
-        :return: (confidences_mapped, values_mapped, obstacle_mapped, obstcl_confidence_mapped), sparse COO tensor in map coordinates
+        :return: (observed_cell_indices, obstacle_mapped, obstcl_confidence_mapped)
+                 observed_cell_indices: torch tensor of shape (2, N) with (x, y) indices of observed cells
+                 obstacle_mapped: sparse COO tensor of obstacle values
+                 obstcl_confidence_mapped: sparse COO tensor of obstacle confidences
         """
         # check if values is on cuda
         if not values.is_cuda:
@@ -473,6 +459,7 @@ class OneMap:
 
 
         # Get all the ids that are affected by the kernel (depth noise blurring)
+        # We still need this for obstacle map blurring, but we don't need to store feature data
         ids = pcl_grid_ids_masked_unique
         all_ids_ = torch.zeros((2, ids.shape[1], self.kernel_size, self.kernel_size), device="cuda")
         all_ids_[0] = (ids[0].unsqueeze(-1).unsqueeze(-1) + self.kernel_ids_x)
@@ -487,7 +474,6 @@ class OneMap:
         # And the depth noise
         depth_noise = torch.sqrt(torch.sum(depths ** 2, dim=0)) * self.depth_factor / self.cell_size
 
-
         # Compute the sum for each kernel centered around a grid cell
         kernel_sums = gaussian_kernel_sum(self.kernel_components_sum, depth_noise).unsqueeze(-1)  # all unique ids
 
@@ -496,30 +482,27 @@ class OneMap:
         kernels = compute_gaussian_kernel_components(self.kernel_components, depth_noise[mapping].reshape(-1,
                                                                                   self.kernel_size, self.kernel_size))
 
-        coalesced_map_data = torch.zeros((all_ids.shape[1], self.feature_dim), dtype=torch.float32, device="cuda")
+        # Only compute blurred scores for obstacle confidence (not feature data)
         coalesced_scores = torch.zeros((all_ids.shape[1], 1), dtype=torch.float32, device="cuda")
-        # Compute the blurred map and blurred scores
-        coalesced_map_data.index_add_(0, mapping, (kernels.unsqueeze(-1) *
-                                                   new_map.unsqueeze(1).unsqueeze(1)).reshape(-1, self.feature_dim))
+        # Compute the blurred scores
         coalesced_scores.index_add_(0, mapping, (kernels * scores_mapped.unsqueeze(1)).reshape(-1, 1))
 
         # Free up memory to avoid OOM
         torch.cuda.empty_cache()
 
-        # Normalize the map and scores
-        coalesced_map_data /= kernel_sums
+        # Normalize the scores
         coalesced_scores /= kernel_sums
 
         # Compute the obstacle map
         obstacle_mapped[:] = (obstacle_mapped > 0).to(torch.float32)
 
         obstacle_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, obstacle_mapped.unsqueeze(1), (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
-        obstcl_confidence_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, obstcl_confidence_mapped, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
-        # print("Updating with sparse matrix of size {}x{} with {} non-zero elements, resulting size is {} Mb".format(
-        #     self.n_cells, self.n_cells, new_map.values().shape[0] * self.feature_dim,
-        #                                 new_map.element_size() * new_map.values().shape[
-        #                                     0] * self.feature_dim / 1024 / 1024))
-        return torch.sparse_coo_tensor(all_ids, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu(), torch.sparse_coo_tensor(all_ids, coalesced_map_data, (self.n_cells, self.n_cells, self.feature_dim), is_coalesced=True).cpu(), obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
+        obstcl_confidence_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
+        
+        # Return observed cell indices (all_ids) for explored_area update
+        observed_cell_indices = all_ids.cpu()
+        
+        return observed_cell_indices, obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
 
     def project_single(self,
                        values: torch.Tensor,

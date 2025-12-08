@@ -4,7 +4,7 @@ for navigation and exploration.
 """
 import time
 
-from mapping import (OneMap, PoseGraph, detect_frontiers, get_frontier_midpoint,
+from mapping import (OneMap, PoseGraph, PoseNode, FrontierNode, detect_frontiers, get_frontier_midpoint,
                      cluster_high_similarity_regions, find_local_maxima,
                      watershed_clustering, gradient_based_clustering, cluster_thermal_image,
                      Cluster, NavGoal, Frontier)
@@ -119,7 +119,6 @@ class Navigator:
     query_text: List[str]  # the query texts as a list. The first element will be used for planning and frontier score
     # computation
     query_text_features: torch.Tensor
-    points_of_interest: List[Cluster]
     blacklisted_nav_goals: List[np.ndarray]
     nav_goals: List[NavGoal]
     last_nav_goal: Union[NavGoal, None]
@@ -160,14 +159,20 @@ class Navigator:
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
-        self.previous_sims = None
 
-        # Frontier and POIs
+        # Current frame image features for frontier embedding extraction
+        self.current_image_features: Optional[torch.Tensor] = None
+        self.current_image: Optional[np.ndarray] = None
+        self.current_depth: Optional[np.ndarray] = None
+        self.current_odometry: Optional[np.ndarray] = None
+
+        # Frontier navigation goals
         self.nav_goals = []
         self.blacklisted_nav_goals = []
         self.artificial_obstacles = []
 
         self.last_nav_goal = None
+        self.last_frontier_node = None  # Track last frontier node for stuck detection
         self.last_pose = None
         self.saw_left = False
         self.saw_right = False
@@ -219,12 +224,12 @@ class Navigator:
     def reset(self):
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
-        self.previous_sims = None
         self.similar_points = None
         self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
         self.last_pose = None
+        self.last_frontier_node = None  # Reset frontier node tracking
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
         self.is_goal_path = False
@@ -236,7 +241,6 @@ class Navigator:
         self.first_obs = True
         self.cyclic_checker = CyclicChecker()
         self.cyclic_detect_checker = CyclicDetectChecker()
-        self.points_of_interest = []
         self.nav_goals = []
         self.blacklisted_nav_goals = []
         self.artificial_obstacles = []
@@ -263,11 +267,12 @@ class Navigator:
             self.query_text = txt
             self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(
                 self.one_map.map_device)
-            self.previous_sims = None
             self.one_map.reset_checked_map()
             self.detector.set_classes(self.query_text)
+            # Reset object detection state when query changes (for multi-object navigation)
             self.object_detected = False
-            self.get_map(False)
+            self.chosen_detection = None
+            self.path = None  # Clear path to allow new exploration
 
     def get_path(self
                  ) -> Union[np.ndarray, str]:
@@ -283,115 +288,320 @@ class Navigator:
     def compute_best_path(self,
                           start: np.ndarray) -> None:
         """
-        Computes the best path from the start point to a point on a frontier, or a point of interest
+        Computes the best path from the start point to a frontier node with highest similarity.
+        Uses PoseGraph FrontierNodes and computes similarity between coarse_embedding and query text.
         :param start: start point as [X, Y]
         :return:
         """
         self.path_id = 0
         if not self.object_detected:
             # We are exploring
+            # First, ensure frontiers are computed
             if len(self.nav_goals) == 0:
                 if not self.initializing:
                     self.one_map.reset_checked_map()  # We need new points of interest
                     self.compute_frontiers_and_POIs(start[0], start[1])
-            # If we still have no nav goals, we can't plan anything
-            if len(self.nav_goals) == 0:
+            
+            # Get all FrontierNodes from PoseGraph
+            frontier_nodes = []
+            for frontier_id in self.pose_graph.frontier_ids:
+                node = self.pose_graph.nodes[frontier_id]
+                if isinstance(node, FrontierNode) and not node.is_explored:
+                    frontier_nodes.append(node)
+            
+            # If no frontier nodes, fall back to nav_goals
+            if len(frontier_nodes) == 0:
+                if len(self.nav_goals) == 0:
+                    return
+                # Fall back to old logic if no FrontierNodes available
+                self._compute_best_path_legacy(start)
                 return
+            
             self.initializing = False
             self.is_goal_path = False
             self.path = None
-            while self.path is None and len(self.nav_goals) > 0:
-                best_idx = None
-                if len(self.nav_goals) == 1:
-                    top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[0].get_score()))
-                else:
-                    top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[1].get_score()))
-
-                # We have a frontier and we need to consider following up on that
-                # Filter out Cluster types - they should not be considered as navigation goals
-                valid_nav_goals = [nav_goal for nav_goal in self.nav_goals if not isinstance(nav_goal, Cluster)]
-                if len(valid_nav_goals) == 0:
-                    # No valid nav goals (only clusters), remove all and reset
-                    # Remove all frontier nodes from pose graph
-                    for nav_goal in self.nav_goals:
-                        if isinstance(nav_goal, Frontier):
-                            frontier_key = tuple(nav_goal.frontier_midpoint)
-                            if frontier_key in self.frontier_node_map:
-                                frontier_node_id = self.frontier_node_map[frontier_key]
-                                self.pose_graph._remove_frontier_node(frontier_node_id)
-                                del self.frontier_node_map[frontier_key]
-                    self.nav_goals = []
-                    break
+            
+            # Compute similarity for each FrontierNode (excluding blacklisted ones)
+            best_frontier_node = None
+            best_similarity = -float('inf')
+            
+            for frontier_node in frontier_nodes:
+                if frontier_node.coarse_embedding is None:
+                    continue  # Skip nodes without embedding
                 
-                curr_index = None
-                if self.last_nav_goal is not None and not isinstance(self.last_nav_goal, Cluster):
-                    last_pt = self.last_nav_goal.get_descr_point()
-                    for nav_id in range(len(self.nav_goals)):
-                        nav_goal = self.nav_goals[nav_id]
-                        if isinstance(nav_goal, Cluster):
-                            continue
-                        if np.array_equal(last_pt, nav_goal.get_descr_point()):
-                            # frontier still exists!
-                            curr_index = nav_id
-                            break
-                    if curr_index is None:
-                        closest_index = closest_point_within_threshold(valid_nav_goals, last_pt,
-                                                                       0.5 / self.one_map.cell_size)
-                        if closest_index != -1:
-                            # Map back to original index
-                            valid_idx = 0
-                            for nav_id in range(len(self.nav_goals)):
-                                if not isinstance(self.nav_goals[nav_id], Cluster):
-                                    if valid_idx == closest_index:
-                                        curr_index = nav_id
-                                        break
-                                    valid_idx += 1
-                            # there is a close point to the previous frontier that we could consider instead
-                    if curr_index is not None:
-                        curr_value = self.nav_goals[curr_index].get_score()
-                        if curr_value + 0.01 > self.last_nav_goal.get_score():
-                            best_idx = curr_index
-                if best_idx is None:
-                    # Select the current best nav_goal, and check for cyclic (excluding clusters)
-                    for nav_id in range(len(self.nav_goals)):
-                        nav_goal = self.nav_goals[nav_id]
-                        if isinstance(nav_goal, Cluster):
-                            continue
-                        cyclic = self.cyclic_checker.check_cyclic(start, nav_goal.get_descr_point(), top_two_vals)
-                        if cyclic:
-                            continue
-                        best_idx = nav_id
-                        # rr.log("path_updates", rr.TextLog(f"Selected frontier or POI based on score {self.frontiers[best_idx, 2]}. Max score is {self.frontiers[0, 2]}"))
-
-                        break
+                # Check if this frontier is blacklisted
+                goal_world = frontier_node.position[:2]  # [x, y]
+                goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+                goal_point_px = np.array([goal_px, goal_py])
                 
-                # If no valid nav goal found, break the loop
-                if best_idx is None:
-                    break
-                
-                # TODO We should check if the chosen waypoint is reachable via simple path planning!
-                best_nav_goal = self.nav_goals[best_idx]
-                # Double check that best_nav_goal is not a Cluster (should not happen, but safety check)
-                if isinstance(best_nav_goal, Cluster):
-                    # Remove cluster and continue to next iteration
-                    self.nav_goals.pop(best_idx)
+                # Skip if blacklisted
+                if len(self.blacklisted_nav_goals) > 0 and np.any(
+                        np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
                     continue
-                    
-                self.cyclic_checker.add_state_action(start, best_nav_goal.get_descr_point(), top_two_vals)
-                if isinstance(best_nav_goal, Frontier):
-                    self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & (
-                            self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                         best_nav_goal.get_descr_point(),
-                                                         self.obstcl_kernel_size, 2)
-                if self.path is None:
-                    # remove the nav goal from the list, we don't know how to reach it
-                    self.nav_goals.pop(best_idx)
-            if self.path is None:
-                if not self.initializing:
+                
+                # Convert embedding to torch tensor
+                embedding_tensor = torch.from_numpy(frontier_node.coarse_embedding).float()
+                # Reshape for similarity computation: [F] -> [1, F, 1, 1] for dense model compatibility
+                if len(embedding_tensor.shape) == 1:
+                    embedding_tensor = embedding_tensor.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                else:
+                    embedding_tensor = embedding_tensor.unsqueeze(0)
+                
+                # Compute similarity
+                similarity = self.model.compute_similarity(
+                    embedding_tensor.to(self.query_text_features.device),
+                    self.query_text_features
+                )
+                
+                # Extract scalar similarity value
+                if similarity.numel() == 1:
+                    sim_value = similarity.item()
+                else:
+                    sim_value = similarity.mean().item()
+                
+                if sim_value > best_similarity:
+                    best_similarity = sim_value
+                    best_frontier_node = frontier_node
+            
+            # If we found a best frontier node, plan path to it
+            if best_frontier_node is not None:
+                # Convert world position to map pixel coordinates
+                goal_world = best_frontier_node.position[:2]  # [x, y]
+                goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+                goal_point = np.array([goal_px, goal_py])
+                
+                # Plan path using Grid Map (navigable_map)
+                # Use explored_area instead of confidence_map > 0
+                explored_mask = self.one_map.explored_area.astype(np.uint8)
+                self.path = Planning.compute_to_goal(
+                    start,
+                    self.one_map.navigable_map & explored_mask,
+                    explored_mask,
+                    goal_point,
+                    self.obstcl_kernel_size,
+                    2
+                )
+                
+                if self.path:
                     if self.log:
-                        rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
-                    self.one_map.reset_checked_map()
+                        rr.log("path_updates", rr.TextLog(
+                            f"Selected frontier node with similarity {best_similarity:.3f} at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                        ))
+                        # 경로 좌표를 [y, x]에서 [x, y]로 스왑
+                        path_swapped = np.array(self.path)[:, [1, 0]]
+                        rr.log("map/path", rr.LineStrips2D(
+                            path_swapped,
+                            colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :], len(self.path), axis=0)
+                        ))
+                    
+                    # Track stuck state for this frontier
+                    # Check if we're stuck (not moving towards goal)
+                    if self.last_pose is not None:
+                        # Check if position hasn't changed much and path is short (stuck indicator)
+                        if (len(self.path) < 5 and 
+                            self.last_pose[0] == start[0] and 
+                            self.last_pose[1] == start[1]):
+                            # Only increment if we're still targeting the same frontier
+                            if (self.last_frontier_node is not None and 
+                                self.last_frontier_node.id == best_frontier_node.id):
+                                self.stuck_at_nav_goal_counter += 1
+                            else:
+                                # New frontier, reset counter
+                                self.stuck_at_nav_goal_counter = 1
+                        else:
+                            # Reset counter if we're making progress or targeting different frontier
+                            if (self.last_frontier_node is None or 
+                                self.last_frontier_node.id != best_frontier_node.id):
+                                self.stuck_at_nav_goal_counter = 0
+                    # Update last frontier node
+                    self.last_frontier_node = best_frontier_node
+                    
+                    # If stuck for too long, blacklist this frontier
+                    if self.stuck_at_nav_goal_counter > 10:
+                        # Blacklist this frontier
+                        self.blacklisted_nav_goals.append(goal_point)
+                        # Remove from pose graph
+                        frontier_key = tuple(goal_point)
+                        if frontier_key in self.frontier_node_map:
+                            frontier_node_id = self.frontier_node_map[frontier_key]
+                            self.pose_graph._remove_frontier_node(frontier_node_id)
+                            del self.frontier_node_map[frontier_key]
+                        # Mark as explored to prevent re-selection
+                        best_frontier_node.is_explored = True
+                        if self.log:
+                            rr.log("path_updates", rr.TextLog(
+                                f"Frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) blacklisted due to stuck state."
+                            ))
+                        # Clear path and try again
+                        self.path = None
+                        self.stuck_at_nav_goal_counter = 0
+                        # Recursively try to find another frontier
+                        if len(frontier_nodes) > 1:
+                            self.compute_best_path(start)
+                            return
+                else:
+                    # No path found - blacklist this frontier
+                    self.blacklisted_nav_goals.append(goal_point)
+                    # Remove from pose graph
+                    frontier_key = tuple(goal_point)
+                    if frontier_key in self.frontier_node_map:
+                        frontier_node_id = self.frontier_node_map[frontier_key]
+                        self.pose_graph._remove_frontier_node(frontier_node_id)
+                        del self.frontier_node_map[frontier_key]
+                    # Mark as explored to prevent re-selection
+                    best_frontier_node.is_explored = True
+                    if self.log:
+                        rr.log("path_updates", rr.TextLog(
+                            f"Frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) blacklisted - no path found."
+                        ))
+                    # Try to find another frontier
+                    if len(frontier_nodes) > 1:
+                        self.compute_best_path(start)
+                        return
+            else:
+                # No valid frontier nodes with embeddings, fall back to nav_goals
+                if len(self.nav_goals) > 0:
+                    self._compute_best_path_legacy(start)
+                else:
+                    if self.log:
+                        rr.log("path_updates", rr.TextLog("No frontier nodes or nav goals available."))
+        else:
+            # Object detection path (unchanged)
+            if np.linalg.norm(start - self.chosen_detection) < self.max_detect_distance:
+                self.path = [start] * 5
+                return
+            # Use explored_area instead of confidence_map > 0
+            explored_mask = self.one_map.explored_area.astype(np.uint8)
+            self.path = Planning.compute_to_goal(
+                start,
+                self.one_map.navigable_map,
+                explored_mask,
+                self.chosen_detection,
+                self.obstcl_kernel_size,
+                self.min_goal_dist
+            )
+            self.is_goal_path = True
+            if self.path and len(self.path) > 0:
+                if self.log:
+                    # 경로 좌표를 [y, x]에서 [x, y]로 스왑
+                    path_swapped = np.array(self.path)[:, [1, 0]]
+                    rr.log("map/path", rr.LineStrips2D(
+                        path_swapped,
+                        colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :], len(self.path), axis=0)
+                    ))
+    
+    def _compute_best_path_legacy(self, start: np.ndarray) -> None:
+        """
+        Legacy path computation using nav_goals (fallback when no FrontierNodes available).
+        :param start: start point as [X, Y]
+        :return:
+        """
+        # If we still have no nav goals, we can't plan anything
+        if len(self.nav_goals) == 0:
+            return
+        self.initializing = False
+        self.is_goal_path = False
+        self.path = None
+        best_nav_goal = None  # Initialize to avoid undefined variable error
+        while self.path is None and len(self.nav_goals) > 0:
+            best_idx = None
+            if len(self.nav_goals) == 1:
+                top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[0].get_score()))
+            else:
+                top_two_vals = tuple((self.nav_goals[0].get_score(), self.nav_goals[1].get_score()))
+
+            # We have a frontier and we need to consider following up on that
+            # Filter out Cluster types - they should not be considered as navigation goals
+            valid_nav_goals = [nav_goal for nav_goal in self.nav_goals if not isinstance(nav_goal, Cluster)]
+            if len(valid_nav_goals) == 0:
+                # No valid nav goals (only clusters), remove all and reset
+                # Remove all frontier nodes from pose graph
+                for nav_goal in self.nav_goals:
+                    if isinstance(nav_goal, Frontier):
+                        frontier_key = tuple(nav_goal.frontier_midpoint)
+                        if frontier_key in self.frontier_node_map:
+                            frontier_node_id = self.frontier_node_map[frontier_key]
+                            self.pose_graph._remove_frontier_node(frontier_node_id)
+                            del self.frontier_node_map[frontier_key]
+                self.nav_goals = []
+                break
+            
+            curr_index = None
+            if self.last_nav_goal is not None and not isinstance(self.last_nav_goal, Cluster):
+                last_pt = self.last_nav_goal.get_descr_point()
+                for nav_id in range(len(self.nav_goals)):
+                    nav_goal = self.nav_goals[nav_id]
+                    if isinstance(nav_goal, Cluster):
+                        continue
+                    if np.array_equal(last_pt, nav_goal.get_descr_point()):
+                        # frontier still exists!
+                        curr_index = nav_id
+                        break
+                if curr_index is None:
+                    closest_index = closest_point_within_threshold(valid_nav_goals, last_pt,
+                                                                   0.5 / self.one_map.cell_size)
+                    if closest_index != -1:
+                        # Map back to original index
+                        valid_idx = 0
+                        for nav_id in range(len(self.nav_goals)):
+                            if not isinstance(self.nav_goals[nav_id], Cluster):
+                                if valid_idx == closest_index:
+                                    curr_index = nav_id
+                                    break
+                                valid_idx += 1
+                        # there is a close point to the previous frontier that we could consider instead
+                if curr_index is not None:
+                    curr_value = self.nav_goals[curr_index].get_score()
+                    if curr_value + 0.01 > self.last_nav_goal.get_score():
+                        best_idx = curr_index
+            if best_idx is None:
+                # Select the current best nav_goal, and check for cyclic (excluding clusters)
+                for nav_id in range(len(self.nav_goals)):
+                    nav_goal = self.nav_goals[nav_id]
+                    if isinstance(nav_goal, Cluster):
+                        continue
+                    cyclic = self.cyclic_checker.check_cyclic(start, nav_goal.get_descr_point(), top_two_vals)
+                    if cyclic:
+                        continue
+                    best_idx = nav_id
+                    # rr.log("path_updates", rr.TextLog(f"Selected frontier or POI based on score {self.frontiers[best_idx, 2]}. Max score is {self.frontiers[0, 2]}"))
+
+                    break
+            
+            # If no valid nav goal found, break the loop
+            if best_idx is None:
+                break
+            
+            # TODO We should check if the chosen waypoint is reachable via simple path planning!
+            best_nav_goal = self.nav_goals[best_idx]
+            # Double check that best_nav_goal is not a Cluster (should not happen, but safety check)
+            if isinstance(best_nav_goal, Cluster):
+                # Remove cluster and continue to next iteration
+                self.nav_goals.pop(best_idx)
+                continue
+                
+            self.cyclic_checker.add_state_action(start, best_nav_goal.get_descr_point(), top_two_vals)
+            if isinstance(best_nav_goal, Frontier):
+                # Use explored_area instead of confidence_map > 0
+                explored_mask = self.one_map.explored_area.astype(np.uint8)
+                self.path = Planning.compute_to_goal(start, self.one_map.navigable_map & explored_mask,
+                                                     explored_mask,
+                                                     best_nav_goal.get_descr_point(),
+                                                     self.obstcl_kernel_size, 2)
+            if self.path is None:
+                # remove the nav goal from the list, we don't know how to reach it
+                self.nav_goals.pop(best_idx)
+        
+        # Handle path planning results
+        if self.path is None:
+            if not self.initializing:
+                if self.log:
+                    rr.log("path_updates", rr.TextLog(f"Resetting checked map as no path found."))
+                self.one_map.reset_checked_map()
+            return  # No path found, exit early
+        
+        # Update last_nav_goal and stuck counter only if we have a valid path and nav goal
+        if best_nav_goal is not None:
             if self.last_nav_goal is not None and not np.array_equal(self.last_nav_goal.get_descr_point(),
                                                                      best_nav_goal.get_descr_point()):
                 self.stuck_at_nav_goal_counter = 0
@@ -408,36 +618,15 @@ class Navigator:
                                                       f",{best_nav_goal.get_descr_point()[1]} invalid."))
             self.last_nav_goal = best_nav_goal
 
-            if self.path:
-                if self.log:
-                    rr.log("path_updates", rr.TextLog(f"Computed path of length {len(self.path)}"))
-                    # 경로 좌표를 [y, x]에서 [x, y]로 스왑
-                    path_swapped = np.array(self.path)[:, [1, 0]]
-                    rr.log("map/path", rr.LineStrips2D(path_swapped, colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
-                                                                                   len(self.path), axis=0)))
-        else:
-            # We go to an object
-            if np.linalg.norm(start - self.chosen_detection) < self.max_detect_distance:
-                self.path = [start] * 5
-                # We are close to the object, we don't need to move
-                return
-            self.path = Planning.compute_to_goal(start, self.one_map.navigable_map,
-                                                 (self.one_map.confidence_map > 0).cpu().numpy(),
-                                                 self.chosen_detection,
-                                                 self.obstcl_kernel_size, self.min_goal_dist)
-            self.is_goal_path = True
-            if self.path and len(self.path) > 0:
-                if self.log:
-                    # 경로 좌표를 [y, x]에서 [x, y]로 스왑
-                    path_swapped = np.array(self.path)[:, [1, 0]]
-                    rr.log("map/path", rr.LineStrips2D(path_swapped, colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :],
-                                                                                   len(self.path), axis=0)))
-                    rr.log("path_updates",
-                           rr.TextLog(f"Path to object {self.query_text[0]} of length {len(self.path)} computed."))
-            else:
-                self.object_detected = False
-                if self.log:
-                    rr.log("path_updates", rr.TextLog(f"No path to object {self.query_text[0]} found."))
+        if self.path:
+            if self.log:
+                rr.log("path_updates", rr.TextLog(f"Computed path of length {len(self.path)}"))
+                # 경로 좌표를 [y, x]에서 [x, y]로 스왑
+                path_swapped = np.array(self.path)[:, [1, 0]]
+                rr.log("map/path", rr.LineStrips2D(path_swapped, colors=np.repeat(np.array([0, 0, 255])[np.newaxis, :],
+                                                                               len(self.path), axis=0)))
+        # Note: Object detection path handling is done in compute_best_path(), not here
+        # This function is only for exploration mode (frontier navigation)
 
     def compute_frontiers_and_POIs(self, px, py):
         """
@@ -456,54 +645,37 @@ class Navigator:
                 del self.frontier_node_map[frontier_key]
         
         self.nav_goals = []
-        if self.previous_sims is not None:
-            # Compute the frontiers using VLFM classical definition
-            # explored_area (confidence > 0) vs unexplored (confidence == 0)
-            frontiers, unexplored_map, largest_contour = detect_frontiers(
-                self.one_map.navigable_map.astype(np.uint8),
-                self.one_map.explored_area.astype(np.uint8),
-                None,  # known_th parameter is not used in VLFM style
-                int(1.0 * ((
-                                   self.one_map.n_cells /
-                                   self.one_map.size) ** 2)))
+        # Compute the frontiers using VLFM classical definition
+        # explored_area vs unexplored (no longer using confidence_map)
+        frontiers, unexplored_map, largest_contour = detect_frontiers(
+            self.one_map.navigable_map.astype(np.uint8),
+            self.one_map.explored_area.astype(np.uint8),
+            None,  # known_th parameter is not used in VLFM style
+            int(1.0 * ((
+                               self.one_map.n_cells /
+                               self.one_map.size) ** 2)))
 
-            # moreover we compute points of interest. These are high similarity regions within the fully explored,
-            # but not checked map
-            # For that we make use of the cluster_high_similarity_regions function, and project the points to the
-            # navigable map
-            adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-            map_def = self.previous_sims[0].numpy()
-            normalized_map = (map_def - map_def.min()) / (map_def.max() - map_def.min())
-            # TODO This will give us wrong cluster scores, we will need to adjust this to match the frontier scores!
-            clusters = cluster_high_similarity_regions(normalized_map,
-                                                       (self.one_map.confidence_map > 0.0).cpu().numpy())
-            # clusters = cluster_high_similarity_regions(normalized_map, map_def > 0.0)
-            for cluster in clusters:
-                cluster.compute_score(adjusted_score)
-                if len(self.blacklisted_nav_goals) == 0 or not np.any( #
-                        np.all(cluster.get_descr_point() == self.blacklisted_nav_goals, axis=1)):
-                    if ((largest_contour is None or cv2.pointPolygonTest(largest_contour, cluster.center.astype(float),
-                                                                         measureDist=True) > -15.0) or
-                        self.one_map.fully_explored_map[cluster.center[0], cluster.center[1]]) and \
-                            (not self.one_map.checked_map[cluster.center[0], cluster.center[1]]):
-                        self.nav_goals.append(cluster)
+        # Note: Points of interest (POIs) are no longer computed.
+        # Frontier selection is now based on pose-graph FrontierNode similarity scores.
 
-            if self.log:
-                log_map_rerun(unexplored_map, path="map/unexplored")
+        if self.log:
+            log_map_rerun(unexplored_map, path="map/unexplored")
 
-            frontiers = [f[:, :, ::-1] for f in frontiers]  # need to flip coords for some reason
-            adjusted_score_frontier = adjusted_score.copy()
+        frontiers = [f[:, :, ::-1] for f in frontiers]  # need to flip coords for some reason
 
-            # set the score of the fully explored map to 0 for the frontiers
-            valid_frontiers_mask = np.zeros((len(frontiers),), dtype=bool)
+        # set the score of the fully explored map to 0 for the frontiers
+        valid_frontiers_mask = np.zeros((len(frontiers),), dtype=bool)
 
-            for i_frontier, frontier in enumerate(frontiers):
+        for i_frontier, frontier in enumerate(frontiers):
                 frontier_mp = get_frontier_midpoint(frontier).astype(np.uint32)
-                score, n_els, best_reachable, reachable_area = Planning.compute_reachable_area_score(
-                    frontier_mp,
-                    (self.one_map.confidence_map > 0).cpu().numpy(),
-                    adjusted_score_frontier,
-                    self.frontier_depth)
+                # Use explored_area instead of confidence_map for reachable area score
+                # Since we don't have similarity map anymore, use a simple score based on frontier size
+                explored_mask = self.one_map.explored_area.astype(np.uint8)
+                # Simple score: use frontier size as score (can be improved later)
+                score = len(frontier) * 0.1  # Simple heuristic score
+                n_els = len(frontier)
+                best_reachable = frontier_mp
+                reachable_area = explored_mask
                 frontier_mp = np.round(frontier_mp)
                 if len(self.blacklisted_nav_goals) == 0 or not np.any(
                         np.all(frontier_mp == self.blacklisted_nav_goals, axis=1)):
@@ -521,17 +693,44 @@ class Navigator:
                             x_world, y_world = self.one_map.px_to_metric(frontier_mp[0], frontier_mp[1])
                             position_w = np.array([x_world, y_world, 0.0])
                             
+                            # Extract image feature at frontier location
+                            coarse_embedding = None
+                            if (self.current_image_features is not None and 
+                                self.current_depth is not None and 
+                                self.current_odometry is not None):
+                                # Get current pose for yaw
+                                current_pose = self.pose_graph.nodes[current_pose_id]
+                                assert isinstance(current_pose, PoseNode)
+                                yaw = current_pose.theta
+                                
+                                # Convert world position to camera pixel coordinates
+                                pixel_coords = self._world_to_camera_pixel(
+                                    position_w,
+                                    self.current_depth,
+                                    yaw,
+                                    self.current_odometry
+                                )
+                                
+                                if pixel_coords is not None:
+                                    pixel_x, pixel_y = pixel_coords
+                                    # Extract feature at this pixel location
+                                    coarse_embedding = self._extract_image_feature_at_pixel(
+                                        self.current_image_features,
+                                        pixel_x,
+                                        pixel_y
+                                    )
+                            
                             # Add frontier node to pose graph
                             fr_node = self.pose_graph.add_frontier_node(
                                 pose_id=current_pose_id,
                                 position_w=position_w,
-                                coarse_embedding=None,
+                                coarse_embedding=coarse_embedding,
                                 semantic_hint=None,
                             )
                             # Store mapping from frontier midpoint to node ID
                             self.frontier_node_map[frontier_key] = fr_node.id
 
-            self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
+        self.nav_goals = sorted(self.nav_goals, key=lambda x: x.get_score(), reverse=True)
 
     def add_data(self,
                  image: np.ndarray,
@@ -708,16 +907,22 @@ class Navigator:
         a = time.time()
         image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
         b = time.time()
+        
+        # Store current frame data for frontier embedding extraction
+        self.current_image_features = image_features
+        self.current_image = image
+        self.current_depth = depth
+        self.current_odometry = odometry
+        
         self.one_map.update(image_features, depth, odometry, self.artificial_obstacles)
-        c = time.time()
-        self.get_map(False)
-        d = time.time()
         detected_just_now = False
         start = np.array([px, py])
         old_path = self.path.copy() if self.path else self.path
         old_id = self.path_id
         if self.first_obs:
-            self.one_map.confidence_map[px - 10:px + 10, py - 10:py + 10] += 10
+            # Mark initial area as explored and checked
+            # Use explored_area and checked_conf_map directly
+            self.one_map.explored_area[px - 10:px + 10, py - 10:py + 10] = True
             self.one_map.checked_conf_map[px - 10:px + 10, py - 10:py + 10] += 10
             self.first_obs = False
         # if detections.class_id.shape[0] > 0:
@@ -763,48 +968,16 @@ class Navigator:
                            self.one_map.map_center_cells[1].item()
 
                     object_valid = True
-                    adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
                     if self.log:
                         rr.log("map/proj_detect",
                                rr.Points2D(np.stack((x_id, y_id)).T, colors=[[0, 0, 255]], radii=[1]))
                         # log the segmentation mask as rgba
                         rr.log("camera", rr.SegmentationImage(masks[0].astype(np.uint8))
                                )
-                    if self.consensus_filtering:
-                        top_10 = np.percentile(adjusted_score[self.one_map.confidence_map > 0],
-                                               self.percentile_exploitation)
-                        top_map = (adjusted_score > top_10).astype(np.uint8)
-
-                        # print(top_10)  # Debug output disabled
-                        top_map[self.one_map.confidence_map == 0] = 0
-                        k = np.ones((7, 7), np.uint8)
-                        top_map = cv2.dilate(top_map, k, iterations=1)
-                        # log_map_rerun((adjusted_score > 1.0).astype(np.float32), path="map/similarity_th")
-                        top_map_projections = top_map[x_id, y_id]
-                        if not np.any(top_map_projections):
-                            object_valid = False
-
-                        if object_valid:
-                            mask = top_map_projections
-                            x_masked = x_id[mask == 1]
-                            y_masked = y_id[mask == 1]
-                            depths_masked = depths[mask == 1]
-                            best = np.argmin(depths_masked)
-
-                            if self.object_detected and object_valid:
-                                # we already have a goal point and will only update if the current one is better
-                                if adjusted_score[x_masked[best], y_masked[best]] < \
-                                        adjusted_score[self.chosen_detection[0], self.chosen_detection[1]] * 1.1:
-                                    object_valid = False
-                            if object_valid:
-                                # self.object_detected = True
-                                self.chosen_detection = (x_masked[best], y_masked[best])
-                    else:
+                    # Consensus filtering is disabled since we don't have similarity map anymore
+                    # Simply use the closest valid detection point
+                    if object_valid:
                         best = np.argmin(depths)
-                        if self.object_detected:
-                            if adjusted_score[x_id[best], y_id[best]] < \
-                                    adjusted_score[self.chosen_detection[0], self.chosen_detection[1]] * 1.1:
-                                object_valid = False
                         if object_valid:
                             self.chosen_detection = (x_id[best], y_id[best])
                     if object_valid:
@@ -832,42 +1005,132 @@ class Navigator:
                 self.cyclic_detect_checker.add_state_action(np.array([px, py]), "R")
         self.compute_frontiers_and_POIs(*self.one_map.metric_to_px(odometry[0, 3], odometry[1, 3]))
         e = time.time()
-        if self.log:
-            adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-
-            top_10 = np.percentile(adjusted_score[self.one_map.confidence_map > 0],
-                                   self.percentile_exploitation)
-            top_map = (adjusted_score > top_10).astype(np.uint8)
-            k = np.ones((3, 3), np.uint8)
-            top_map = cv2.dilate(top_map, k, iterations=1)
-            log_map_rerun(top_map, path="map/similarity_th")
+        # Similarity map logging is disabled since we don't have feature_map/confidence_map anymore
         # Compute the new path
         # TODO Make the thresholds and distances to object a parameter
         if self.object_detected:
             if np.linalg.norm(start - self.chosen_detection) <= self.max_detect_distance:
+                # Object reached: reset detection state and signal success
                 self.object_detected = False
+                self.chosen_detection = None
+                self.path = None  # Clear path to allow new exploration
                 return True
-            if self.consensus_filtering and self.object_detected:
-                adjusted_score = self.previous_sims[0].cpu().numpy() + 1.0  # only positive scores
-
-                top_10 = np.percentile(adjusted_score[self.one_map.confidence_map > 0],
-                                       self.percentile_exploitation)
-                top_map = (adjusted_score > top_10).astype(np.uint8)
-                k = np.ones((7, 7), np.uint8)
-                top_map = cv2.dilate(top_map, k, iterations=1)
-                if not top_map[self.chosen_detection[0], self.chosen_detection[1]]:
-                    self.object_detected = False
-                    rr.log("path_updates", rr.TextLog("Current path lost similarity."))
+            # Consensus filtering is disabled since we don't have similarity map anymore
         if self.allow_replan:
             self.compute_best_path(start)
         if self.object_detected and len(self.path) < 3:
+            # Path too short (likely reached object): reset detection state and signal success
             self.object_detected = False
+            self.chosen_detection = None
+            self.path = None  # Clear path to allow new exploration
             return True
         self.last_pose = (px, py, yaw)
 
     def get_pose_graph_statistics(self) -> dict:
         """Get pose graph statistics for monitoring."""
         return self.pose_graph.get_statistics()
+
+    def _world_to_camera_pixel(
+        self,
+        world_pos: np.ndarray,
+        depth: np.ndarray,
+        yaw: float,
+        odometry: np.ndarray,
+    ) -> Optional[Tuple[int, int]]:
+        """
+        Convert world coordinates to camera pixel coordinates.
+        Uses the same coordinate system as project_depth_camera:
+        - Camera frame: x is depth (forward), y is horizontal (left), z is vertical (up)
+        - Inverse of: pixel -> camera -> world transformation
+        
+        Args:
+            world_pos: World position (3,) [x, y, z] (z is typically 0 for ground plane)
+            depth: Depth image (H, W) - used for bounds checking
+            yaw: Current yaw angle (rotation around z-axis)
+            odometry: 4x4 transformation matrix from camera to world
+            
+        Returns:
+            Tuple of (pixel_x, pixel_y) if valid, None otherwise
+        """
+        # Convert world position to camera-relative position
+        world_x = world_pos[0] - odometry[0, 3]
+        world_y = world_pos[1] - odometry[1, 3]
+        world_z = world_pos[2] - odometry[2, 3] if len(world_pos) > 2 else 0.0
+        
+        # Rotate by -yaw (inverse rotation to get camera-local coordinates)
+        # This matches the rotation in rotate_pcl function
+        cos_yaw = np.cos(-yaw)
+        sin_yaw = np.sin(-yaw)
+        r_inv = np.array([[cos_yaw, -sin_yaw],
+                          [sin_yaw, cos_yaw]])
+        
+        # Apply rotation to get camera-local 2D coordinates
+        cam_local_2d = np.dot(r_inv, np.array([world_x, world_y]))
+        
+        # Camera coordinate system (from project_depth_camera):
+        # x_cam = depth (forward into image)
+        # y_cam = horizontal (left)
+        # z_cam = vertical (up)
+        x_cam = np.sqrt(cam_local_2d[0]**2 + cam_local_2d[1]**2)  # depth
+        y_cam = -cam_local_2d[1]  # horizontal (left is positive in camera frame)
+        z_cam = -world_z  # vertical (up is positive in camera frame, but we use -world_z)
+        
+        # Check if depth is valid
+        if x_cam <= 0 or x_cam > 10.0:
+            return None
+        
+        # Project to pixel coordinates (inverse of project_depth_camera)
+        # From project_depth_camera: x_world = (xx - cx) * zz / fx, y_world = (yy - cy) * zz / fy
+        # Inverse: pixel_x = -y_cam * fx / x_cam + cx, pixel_y = -z_cam * fy / x_cam + cy
+        pixel_x = int(-y_cam * self.one_map.fx / x_cam + self.one_map.cx)
+        pixel_y = int(-z_cam * self.one_map.fy / x_cam + self.one_map.cy)
+        
+        # Check if within image bounds
+        if 0 <= pixel_x < depth.shape[1] and 0 <= pixel_y < depth.shape[0]:
+            return (pixel_x, pixel_y)
+        return None
+    
+    def _extract_image_feature_at_pixel(
+        self,
+        image_features: torch.Tensor,
+        pixel_x: int,
+        pixel_y: int,
+    ) -> Optional[np.ndarray]:
+        """
+        Extract image feature at specific pixel location from dense feature map.
+        
+        Args:
+            image_features: Dense image features [F, Hf, Wf]
+            pixel_x: Pixel x coordinate in original image
+            pixel_y: Pixel y coordinate in original image
+            
+        Returns:
+            Feature vector [F] if valid, None otherwise
+        """
+        # Get feature map dimensions
+        feat_h, feat_w = image_features.shape[1], image_features.shape[2]
+        
+        # Scale pixel coordinates to feature map coordinates
+        # Assuming image_features are from CLIP dense model
+        # Need to know original image size - use current_image if available
+        if self.current_image is not None:
+            img_h, img_w = self.current_image.shape[1], self.current_image.shape[2]
+            feat_x = int(pixel_x * feat_w / img_w)
+            feat_y = int(pixel_y * feat_h / img_h)
+        else:
+            # Fallback: assume feature map is same size as depth
+            if self.current_depth is not None:
+                img_h, img_w = self.current_depth.shape[0], self.current_depth.shape[1]
+                feat_x = int(pixel_x * feat_w / img_w)
+                feat_y = int(pixel_y * feat_h / img_h)
+            else:
+                return None
+        
+        # Check bounds
+        if 0 <= feat_x < feat_w and 0 <= feat_y < feat_h:
+            feature = image_features[:, feat_y, feat_x].cpu().numpy()
+            return feature
+        return None
 
     def _compute_world_center_from_mask(
         self,
@@ -925,43 +1188,23 @@ class Navigator:
                 return_map=True
                 ) -> Optional[np.ndarray]:
         """
-        Returns the similarity map given the query text
-        :return: map as numpy array
+        Legacy method - no longer computes pixel-level similarity map.
+        Kept for compatibility but returns None.
+        Similarity is now computed at FrontierNode level in compute_best_path().
         """
-        if self.query_text_features is None:
-            raise ValueError("No query text set")
-        map_features = self.one_map.feature_map  # [X, Y, F]
-        mask = self.one_map.updated_mask
-        if mask.max() == 0:
-            if return_map:
-                return self.previous_sims.cpu().numpy()
-            else:
-                return
-        if self.previous_sims is not None:
-            map_features = map_features[mask, :].permute(1, 0).unsqueeze(0)
-        else:
-            map_features = map_features.permute(2, 0, 1).unsqueeze(0)
-
-        similarity = self.model.compute_similarity(map_features, self.query_text_features)
-
-        if self.previous_sims is None:
-            self.previous_sims = similarity
-        else:
-            # then, similarity is only updated where the mask is true, otherwise it is the previous similarity
-            self.previous_sims[:, mask] = similarity
-        self.one_map.reset_updated_mask()
-        if return_map:
-            return self.previous_sims.cpu().numpy()
-        else:
-            return
+        # This method is deprecated - similarity is now computed at FrontierNode level
+        # Return None to maintain compatibility
+        return None
 
     def get_confidence_map(self,
                            ) -> np.ndarray:
         """
-          Returns the confidence map
-          :return: map as numpy array
+          Legacy method - confidence_map no longer exists.
+          Returns explored_area as a replacement.
+          :return: explored_area as numpy array
           """
-        return self.one_map.confidence_map.cpu().numpy()
+        # Return explored_area as a replacement for confidence_map
+        return self.one_map.explored_area.astype(np.float32)
 
 
 if __name__ == "__main__":
@@ -1002,7 +1245,9 @@ if __name__ == "__main__":
         # yw_detections[0].show()
 
     print(f"Entire map update: {(time.time() - a) / 10}")
-    sims = mapper.get_map()
-    plt.imshow(sims[0])
+    # get_map() no longer returns similarity map (returns None)
+    # Use explored_area for visualization instead
+    explored_area = mapper.get_confidence_map()  # Returns explored_area
+    plt.imshow(explored_area)
     plt.savefig("firstmap.png")
     plt.show()
