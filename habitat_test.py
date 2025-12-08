@@ -28,6 +28,7 @@ from mapping import Navigator
 from mapping import Frontier
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
+from vision_models.yolov8_model import YoloV8Detector
 
 # from onemap_utils import log_map_rerun
 from planning import Planning, Controllers
@@ -52,13 +53,14 @@ if __name__ == "__main__":
     
     model = ClipModel("weights/clip.pth")
     # Target object detector (for navigation)
-    detector = YOLOWorldDetector(0.8)
+    #detector = YOLOWorldDetector(0.8)
+    detector = YoloV8Detector(0.8)
     mapper = Navigator(model, detector, config)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs = ["couch"]
+    qs =["tv", "couch", "toilet", "bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
@@ -215,6 +217,19 @@ if __name__ == "__main__":
             print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "
                   f"Edges: {stats['edge_count']} (pose_pose: {stats['pose_pose_edges']}, "
                   f"pose_object: {stats['pose_object_edges']})")
+            
+            # Print registered objects in graph
+            if len(mapper.pose_graph.object_ids) > 0:
+                print(f"  Registered Objects:")
+                for obj_id in mapper.pose_graph.object_ids:
+                    obj_node = mapper.pose_graph.nodes[obj_id]
+                    print(f"    - {obj_node.label}: pos=({obj_node.position[0]:.2f}, {obj_node.position[1]:.2f}), "
+                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}")
+        
+        # Print target object info if navigating to graph-based target
+        if mapper.target_object_node is not None:
+            print(f"[Target] Navigating to '{mapper.target_object_node.label}' "
+                  f"at ({mapper.target_object_node.position[0]:.2f}, {mapper.target_object_node.position[1]:.2f})")
 
         cam_x = pos[0, 0]
         cam_y = pos[1, 0]

@@ -269,30 +269,41 @@ class OneMap:
                     # 관측 신뢰도를 누적 (현재 관측값에 대한 명시적 신뢰도가 없으므로 1.0 가중을 합산)
                     self.checked_conf_map[valid_indices_torch[0].long(), valid_indices_torch[1].long()] += 1.0
 
-            # Obstacle Map update (using EMA fusion)
+            # Obstacle Map update (신뢰도 누적 기반 가중 평균 융합)
             if indices_obstacle.shape[1] > 0:
-                # 신뢰도 누적 기반 가중 평균
+                # 새 관측의 장애물 신뢰도와 값 추출
+                # confs_new: project_dense에서 계산된 신뢰도 (depth, 거리, gradient 기반)
+                # obstacle_values: 장애물 여부 (0 또는 1)
                 confs_new = obstcl_confidence_mapped.values().data.squeeze().to(self.map_device)
                 obstacle_values = obstacle_mapped.values().data.squeeze().to(self.map_device)
 
-                # 1D 보장
+                # 텐서 차원 보장 (1D로 변환)
                 if len(confs_new.shape) > 1:
                     confs_new = confs_new.squeeze()
                 if len(obstacle_values.shape) > 1:
                     obstacle_values = obstacle_values.squeeze()
 
+                # 장애물 셀 인덱스 추출
                 indices_0 = indices_obstacle[0].long().to(self.map_device)
                 indices_1 = indices_obstacle[1].long().to(self.map_device)
 
+                # 신뢰도 누적 기반 가중 평균 계산
+                # 기존 누적 신뢰도 조회
                 confs_old = self.obstacle_conf_map[indices_0, indices_1]
+                # 총 신뢰도 = 기존 신뢰도 + 새 신뢰도
                 conf_den = confs_old + confs_new
+                # 가중치 계산: 기존 값의 비중 = 기존 신뢰도 / 총 신뢰도
                 weight_old = torch.nan_to_num(confs_old / conf_den, nan=0.0)
+                # 가중치 계산: 새 값의 비중 = 새 신뢰도 / 총 신뢰도
                 weight_new = torch.nan_to_num(confs_new / conf_den, nan=0.0)
 
+                # 장애물 맵 업데이트: 가중 평균으로 융합
+                # 관측이 많아질수록 기존 값의 비중이 커져 안정화됨
                 self.obstacle_map[indices_0, indices_1] = (
                     self.obstacle_map[indices_0, indices_1] * weight_old +
                     obstacle_values * weight_new
                 )
+                # 누적 신뢰도 업데이트 (다음 관측을 위한 저장)
                 self.obstacle_conf_map[indices_0, indices_1] = conf_den
 
             self.occluded_map = (self.obstacle_map > self.obstacle_map_threshold).cpu().numpy()
@@ -389,15 +400,8 @@ class OneMap:
         depth_image_smoothed = -torch.nn.functional.max_pool2d(-depth_image_smoothed.unsqueeze(0), kernel_size,
                                                                padding=pad,
                                                                stride=1).squeeze(0)
-        # depth_image_smoothed = F.gaussian_blur(depth_image_smoothed, [31, 31], sigma=4.0)
-        # TODO Gaussian Blur temporarily disabled
-        dx = torch.gradient(depth_image_smoothed, dim=1)[0] / (fx / depth.shape[1])
-        dy = torch.gradient(depth_image_smoothed, dim=0)[0] / (fy / depth.shape[0])
-        gradient_magnitude = torch.sqrt(dx ** 2 + dy ** 2)
-        gradient_magnitude = torch.nn.functional.max_pool2d(gradient_magnitude.unsqueeze(0), 11, stride=1,
-                                                            padding=5).squeeze(0)
-        scores = ((1 - torch.tanh(gradient_magnitude * self.gradient_factor)) *
-                  torch.exp(-((self.optimal_object_distance - depth) / self.optimal_object_factor) ** 2 / 3.0))
+        # 깊이 기반 가중치만 사용 (gradient 계산 제거)
+        scores = torch.exp(-((self.optimal_object_distance - depth) / self.optimal_object_factor) ** 2 / 3.0)
         scores_aligned = scores.reshape(-1)
 
         projected_depth, hole_mask = self.project_depth_camera(depth_aligned, (depth.shape[0], depth.shape[1]), fx,
@@ -448,50 +452,21 @@ class OneMap:
         # Extract the data
         data_dim = combined_data.shape[-1]
         obstacle_mapped = coalesced_combined_data[:, data_dim - 3]
-        scores_mapped = coalesced_combined_data[:, data_dim - 1].unsqueeze(1)
+        scores_mapped = coalesced_combined_data[:, data_dim - 1].unsqueeze(1)   
         sums_per_cell = coalesced_combined_data[:, data_dim - 2].unsqueeze(1)
         new_map = coalesced_combined_data[:, :data_dim - 3]
 
         # Normalize (from sum to mean)
+        # 같은 셀에 여러 관측이 들어온 경우 합을 평균으로 변환
         new_map /= scores_mapped
         scores_mapped /= sums_per_cell
+        # 초기 신뢰도: depth gradient와 거리 기반으로 계산된 score
         obstcl_confidence_mapped = scores_mapped
 
-
-        # Get all the ids that are affected by the kernel (depth noise blurring)
-        # We still need this for obstacle map blurring, but we don't need to store feature data
-        ids = pcl_grid_ids_masked_unique
-        all_ids_ = torch.zeros((2, ids.shape[1], self.kernel_size, self.kernel_size), device="cuda")
-        all_ids_[0] = (ids[0].unsqueeze(-1).unsqueeze(-1) + self.kernel_ids_x)
-        all_ids_[1] = (ids[1].unsqueeze(-1).unsqueeze(-1) + self.kernel_ids_y)
-        all_ids, mapping = all_ids_.reshape(2, -1).unique(dim=1, return_inverse=True)
-
-        # Compute the corresponding depths
-        depths = ((all_ids - self.map_center_cells.unsqueeze(1)) * self.cell_size - torch.tensor([cam_x, cam_y],
-                                                                                 dtype=torch.float32, device="cuda")
-                  .unsqueeze(1))
-
-        # And the depth noise
-        depth_noise = torch.sqrt(torch.sum(depths ** 2, dim=0)) * self.depth_factor / self.cell_size
-
-        # Compute the sum for each kernel centered around a grid cell
-        kernel_sums = gaussian_kernel_sum(self.kernel_components_sum, depth_noise).unsqueeze(-1)  # all unique ids
-
-        # remap the depths to all the id's to kernels centered around the original points in ids and
-        # compute the sparse inverse kernel elements
-        kernels = compute_gaussian_kernel_components(self.kernel_components, depth_noise[mapping].reshape(-1,
-                                                                                  self.kernel_size, self.kernel_size))
-
-        # Only compute blurred scores for obstacle confidence (not feature data)
-        coalesced_scores = torch.zeros((all_ids.shape[1], 1), dtype=torch.float32, device="cuda")
-        # Compute the blurred scores
-        coalesced_scores.index_add_(0, mapping, (kernels * scores_mapped.unsqueeze(1)).reshape(-1, 1))
-
-        # Free up memory to avoid OOM
-        torch.cuda.empty_cache()
-
-        # Normalize the scores
-        coalesced_scores /= kernel_sums
+        # 복잡한 가우시안 블러링 없이, 관측 셀에 한정해 신뢰도 사용
+        # (explored_area/navigable_map 중심 사용 시 성능 부담을 줄이기 위함)
+        all_ids = pcl_grid_ids_masked_unique
+        coalesced_scores = scores_mapped
 
         # Compute the obstacle map
         obstacle_mapped[:] = (obstacle_mapped > 0).to(torch.float32)

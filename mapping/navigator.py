@@ -210,16 +210,41 @@ class Navigator:
         self.allow_far_plan = config.planner.allow_far_plan
 
         # For the closed-vocabulary object detector, not needed for OneMap
-        self.class_map = {}
-        self.class_map["chair"] = "chair"
-        self.class_map["tv_monitor"] = "tv"
-        self.class_map["tv"] = "tv"
-        self.class_map["plant"] = "potted plant"
-        self.class_map["potted plant"] = "potted plant"
-        self.class_map["sofa"] = "couch"
-        self.class_map["couch"] = "couch"
-        self.class_map["bed"] = "bed"
-        self.class_map["toilet"] = "toilet"
+        # 쿼리 텍스트를 COCO 라벨로 매핑 (동의어 처리)
+        self.class_map = {
+            # 기존 매핑
+            "chair": "chair",
+            "tv_monitor": "tv",
+            "tv": "tv",
+            "television": "tv",
+            "monitor": "tv",
+            "plant": "potted plant",
+            "potted plant": "potted plant",
+            "sofa": "couch",
+            "couch": "couch",
+            "bed": "bed",
+            "toilet": "toilet",
+            # COCO 라벨 추가 (YOLOv8 기준)
+            "refrigerator": "refrigerator",
+            "fridge": "refrigerator",
+            "microwave": "microwave",
+            "oven": "oven",
+            "sink": "sink",
+            "dining table": "dining table",
+            "table": "dining table",
+            "laptop": "laptop",
+            "cell phone": "cell phone",
+            "phone": "cell phone",
+            "book": "book",
+            "clock": "clock",
+            "vase": "vase",
+            "bottle": "bottle",
+            "cup": "cup",
+            "bowl": "bowl",
+        }
+        
+        # 그래프 기반 목표 객체 추적
+        self.target_object_node = None  # 현재 목표로 설정된 ObjectNode
 
     def reset(self):
         self.query_text = ["Other."]
@@ -228,6 +253,7 @@ class Navigator:
         self.similar_scores = None
         self.object_detected = False
         self.chosen_detection = None
+        self.target_object_node = None  # Reset target object node tracking
         self.last_pose = None
         self.last_frontier_node = None  # Reset frontier node tracking
         self.stuck_at_nav_goal_counter = 0
@@ -272,7 +298,74 @@ class Navigator:
             # Reset object detection state when query changes (for multi-object navigation)
             self.object_detected = False
             self.chosen_detection = None
+            self.target_object_node = None  # Reset target object node
             self.path = None  # Clear path to allow new exploration
+
+    def find_target_object_in_graph(
+        self,
+        robot_x: float,
+        robot_y: float,
+        min_confidence: float = 0.5,
+        min_observations: int = 2,
+    ) -> Optional[Tuple[np.ndarray, Any]]:
+        """
+        PoseGraph에서 쿼리 텍스트에 매칭되는 가장 가까운 객체 검색.
+        경로 계획이 가능한 객체만 반환.
+        
+        Args:
+            robot_x: 로봇 x 좌표 (metric)
+            robot_y: 로봇 y 좌표 (metric)
+            min_confidence: 최소 신뢰도 임계값 (기본값 0.5, 제거 임계값 0.8보다 낮게 설정)
+            min_observations: 최소 관측 횟수 (노이즈 필터링)
+        
+        Returns:
+            (목표 픽셀 좌표 [px, py], ObjectNode) 또는 None
+        """
+        # class_map을 통해 쿼리 텍스트를 정규화된 라벨로 변환
+        query = self.query_text[0].lower()
+        normalized_label = self.class_map.get(query, query)
+        
+        # 그래프에서 거리순으로 정렬된 모든 객체 검색
+        robot_pos = np.array([robot_x, robot_y])
+        candidates = self.pose_graph.find_all_objects_sorted_by_distance(
+            target_label=normalized_label,
+            robot_position=robot_pos,
+            min_confidence=min_confidence,
+            min_observations=min_observations,
+        )
+        
+        if not candidates:
+            return None
+        
+        # 각 객체에 대해 경로 계획 가능 여부 확인 (거리 가까운 순서대로)
+        start_px, start_py = self.one_map.metric_to_px(robot_x, robot_y)
+        start = np.array([start_px, start_py])
+        explored_mask = self.one_map.explored_area.astype(np.uint8)
+        
+        for target_obj, distance in candidates:
+            # 월드 좌표를 픽셀 좌표로 변환
+            px, py = self.one_map.metric_to_px(
+                target_obj.position[0], 
+                target_obj.position[1]
+            )
+            target_px = np.array([px, py])
+            
+            # 경로 계획 시도
+            test_path = Planning.compute_to_goal(
+                start,
+                self.one_map.navigable_map,
+                explored_mask,
+                target_px,
+                self.obstcl_kernel_size,
+                self.min_goal_dist
+            )
+            
+            if test_path is not None and len(test_path) > 0:
+                # 경로 계획 성공 → 이 객체 반환
+                return target_px, target_obj
+        
+        # 모든 객체에 대해 경로 계획 실패
+        return None
 
     def get_path(self
                  ) -> Union[np.ndarray, str]:
@@ -440,23 +533,19 @@ class Navigator:
                             self.compute_best_path(start)
                             return
                 else:
-                    # No path found - blacklist this frontier
-                    self.blacklisted_nav_goals.append(goal_point)
-                    # Remove from pose graph
-                    frontier_key = tuple(goal_point)
-                    if frontier_key in self.frontier_node_map:
-                        frontier_node_id = self.frontier_node_map[frontier_key]
-                        self.pose_graph._remove_frontier_node(frontier_node_id)
-                        del self.frontier_node_map[frontier_key]
-                    # Mark as explored to prevent re-selection
-                    best_frontier_node.is_explored = True
+                    # No path found - DON'T immediately blacklist, just try another frontier
+                    # Only blacklist after repeated failures (handled by stuck_at_nav_goal_counter)
                     if self.log:
                         rr.log("path_updates", rr.TextLog(
-                            f"Frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) blacklisted - no path found."
+                            f"No path found to frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}), trying another."
                         ))
-                    # Try to find another frontier
+                    # Try to find another frontier without blacklisting
                     if len(frontier_nodes) > 1:
+                        # Temporarily mark as explored to skip in this iteration
+                        best_frontier_node.is_explored = True
                         self.compute_best_path(start)
+                        # Restore for future iterations
+                        best_frontier_node.is_explored = False
                         return
             else:
                 # No valid frontier nodes with embeddings, fall back to nav_goals
@@ -647,13 +736,22 @@ class Navigator:
         self.nav_goals = []
         # Compute the frontiers using VLFM classical definition
         # explored_area vs unexplored (no longer using confidence_map)
+        
+        # Debug: Check map state before frontier detection
+        navigable_sum = self.one_map.navigable_map.sum()
+        explored_sum = self.one_map.explored_area.sum()
+        blacklist_count = len(self.blacklisted_nav_goals)
+        
         frontiers, unexplored_map, largest_contour = detect_frontiers(
-            self.one_map.navigable_map.astype(np.uint8),
-            self.one_map.explored_area.astype(np.uint8),
+            self.one_map.navigable_map.astype(np.uint8).copy(),  # Ensure copy to avoid modification
+            self.one_map.explored_area.astype(np.uint8).copy(),  # Ensure copy to avoid modification
             None,  # known_th parameter is not used in VLFM style
             int(1.0 * ((
                                self.one_map.n_cells /
                                self.one_map.size) ** 2)))
+        
+        # Debug: Log frontier detection results
+        print(f"[DEBUG] compute_frontiers_and_POIs: query={self.query_text}, navigable={navigable_sum}, explored={explored_sum}, frontiers_detected={len(frontiers)}, blacklist={blacklist_count}")
 
         # Note: Points of interest (POIs) are no longer computed.
         # Frontier selection is now based on pose-graph FrontierNode similarity scores.
@@ -930,7 +1028,51 @@ class Navigator:
         last_saw_right = self.saw_right
         self.saw_left = False
         self.saw_right = False
-        if len(detections["boxes"]) > 0:
+        
+        # ===== 그래프 기반 목표 객체 탐색 (YOLO 실시간 감지 전에 먼저 시도) =====
+        if not self.object_detected:
+            graph_result = self.find_target_object_in_graph(x, y)
+            
+            if graph_result is not None:
+                target_px, target_obj = graph_result
+                
+                # 경로가 이미 계산됨 (find_target_object_in_graph에서 검증)
+                self.object_detected = True
+                self.chosen_detection = (target_px[0], target_px[1])
+                self.target_object_node = target_obj
+                
+                # 경로 계획
+                explored_mask = self.one_map.explored_area.astype(np.uint8)
+                self.path = Planning.compute_to_goal(
+                    start,
+                    self.one_map.navigable_map,
+                    explored_mask,
+                    target_px,
+                    self.obstcl_kernel_size,
+                    self.min_goal_dist
+                )
+                self.is_goal_path = True
+                
+                if self.log:
+                    rr.log("path_updates", rr.TextLog(
+                        f"[Graph] Found '{target_obj.label}' in graph at "
+                        f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}), "
+                        f"confidence={target_obj.confidence:.2f}, observations={target_obj.num_observations}"
+                    ))
+                    # 목표 위치 좌표를 [x, y]에서 [y, x]로 스왑
+                    goal_swapped = [self.chosen_detection[1], self.chosen_detection[0]]
+                    rr.log("map/goal_pos",
+                           rr.Points2D([goal_swapped], colors=[[0, 255, 0]], radii=[2]))
+                    if self.path:
+                        path_swapped = np.array(self.path)[:, [1, 0]]
+                        rr.log("map/path", rr.LineStrips2D(
+                            path_swapped,
+                            colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :], len(self.path), axis=0)
+                        ))
+        
+        # ===== YOLO 실시간 감지 (그래프에서 목표를 찾지 못한 경우 폴백) =====
+        if len(detections["boxes"]) > 0 and not self.object_detected:
+            print(f"[DEBUG] add_data: Object detection triggered for query={self.query_text}, boxes={len(detections['boxes'])}")
             # wants rgb
             if not sam_image_set:
                 self.sam_predictor.set_image(rgb_image)
@@ -1011,17 +1153,27 @@ class Navigator:
         if self.object_detected:
             if np.linalg.norm(start - self.chosen_detection) <= self.max_detect_distance:
                 # Object reached: reset detection state and signal success
+                if self.log and self.target_object_node:
+                    rr.log("path_updates", rr.TextLog(
+                        f"[Reached] Target '{self.target_object_node.label}' reached!"
+                    ))
                 self.object_detected = False
                 self.chosen_detection = None
+                self.target_object_node = None  # Reset target object node
                 self.path = None  # Clear path to allow new exploration
                 return True
             # Consensus filtering is disabled since we don't have similarity map anymore
         if self.allow_replan:
             self.compute_best_path(start)
-        if self.object_detected and len(self.path) < 3:
+        if self.object_detected and self.path is not None and len(self.path) < 3:
             # Path too short (likely reached object): reset detection state and signal success
+            if self.log and self.target_object_node:
+                rr.log("path_updates", rr.TextLog(
+                    f"[Reached] Target '{self.target_object_node.label}' reached (short path)!"
+                ))
             self.object_detected = False
             self.chosen_detection = None
+            self.target_object_node = None  # Reset target object node
             self.path = None  # Clear path to allow new exploration
             return True
         self.last_pose = (px, py, yaw)

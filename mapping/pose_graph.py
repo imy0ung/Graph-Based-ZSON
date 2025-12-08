@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Sequence
+from typing import Dict, List, Literal, Optional, Sequence, Tuple
 import time
 import uuid
 from collections import defaultdict
@@ -1118,6 +1118,115 @@ class PoseGraph:
         del self.nodes[obj_id]
         self._dirty = True
     
+    def find_objects_by_label(
+        self,
+        target_label: str,
+        min_confidence: float = 0.5,
+        min_observations: int = 2,
+    ) -> List[ObjectNode]:
+        """
+        특정 라벨을 가진 모든 ObjectNode 반환
+        
+        Args:
+            target_label: 찾고자 하는 객체 라벨
+            min_confidence: 최소 신뢰도 임계값 (기본값 0.5, 제거 임계값 0.8보다 낮음)
+            min_observations: 최소 관측 횟수 (노이즈 필터링)
+        
+        Returns:
+            조건을 만족하는 ObjectNode 리스트
+        """
+        results = []
+        
+        # 공간 인덱스에서 해당 라벨의 모든 객체 검색
+        if target_label not in self._object_spatial_index:
+            return results
+        
+        for cell_objects in self._object_spatial_index[target_label].values():
+            for obj_id in cell_objects:
+                if obj_id not in self.nodes:
+                    continue
+                obj_node = self.nodes[obj_id]
+                if not isinstance(obj_node, ObjectNode):
+                    continue
+                
+                # 신뢰도 및 관측 횟수 필터링
+                if (obj_node.confidence >= min_confidence and 
+                    obj_node.num_observations >= min_observations):
+                    results.append(obj_node)
+        
+        return results
+
+    def find_nearest_object_by_label(
+        self,
+        target_label: str,
+        robot_position: np.ndarray,
+        min_confidence: float = 0.5,
+        min_observations: int = 2,
+    ) -> Optional[ObjectNode]:
+        """
+        로봇 위치 기준 가장 가까운 목표 객체 반환
+        
+        Args:
+            target_label: 찾고자 하는 객체 라벨
+            robot_position: 로봇의 현재 위치 (2,) 또는 (3,)
+            min_confidence: 최소 신뢰도 임계값
+            min_observations: 최소 관측 횟수
+        
+        Returns:
+            가장 가까운 ObjectNode, 없으면 None
+        """
+        candidates = self.find_objects_by_label(target_label, min_confidence, min_observations)
+        
+        if not candidates:
+            return None
+        
+        robot_pos_2d = robot_position[:2]
+        
+        # 거리 기준 정렬하여 가장 가까운 객체 반환
+        candidates_with_dist = [
+            (obj, np.linalg.norm(obj.position[:2] - robot_pos_2d))
+            for obj in candidates
+        ]
+        candidates_with_dist.sort(key=lambda x: x[1])
+        
+        return candidates_with_dist[0][0]
+
+    def find_all_objects_sorted_by_distance(
+        self,
+        target_label: str,
+        robot_position: np.ndarray,
+        min_confidence: float = 0.5,
+        min_observations: int = 2,
+    ) -> List[Tuple[ObjectNode, float]]:
+        """
+        로봇 위치 기준 거리순으로 정렬된 모든 목표 객체 반환
+        (경로 계획 실패 시 다음 가까운 객체를 시도하기 위함)
+        
+        Args:
+            target_label: 찾고자 하는 객체 라벨
+            robot_position: 로봇의 현재 위치 (2,) 또는 (3,)
+            min_confidence: 최소 신뢰도 임계값
+            min_observations: 최소 관측 횟수
+        
+        Returns:
+            (ObjectNode, 거리) 튜플 리스트, 거리순 정렬
+        """
+        candidates = self.find_objects_by_label(target_label, min_confidence, min_observations)
+        
+        if not candidates:
+            return []
+        
+        robot_pos_2d = robot_position[:2]
+        
+        # 거리 기준 정렬
+        candidates_with_dist = [
+            (obj, np.linalg.norm(obj.position[:2] - robot_pos_2d))
+            for obj in candidates
+        ]
+        candidates_with_dist.sort(key=lambda x: x[1])
+        
+        return candidates_with_dist
+
     def get_statistics(self) -> dict: # 그래프 통계 정보 반환
         """Get pose graph statistics."""
         stats = {
