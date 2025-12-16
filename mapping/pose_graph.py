@@ -281,6 +281,21 @@ class PoseGraph:
         
         self._step_counter = 0
 
+    def clear(self) -> None:
+        """
+        Clear all nodes and edges from the pose graph (for episode reset).
+        Database connection is preserved, but in-memory data is cleared.
+        """
+        self.nodes.clear()
+        self.edges.clear()
+        self.pose_ids.clear()
+        self.object_ids.clear()
+        self.frontier_ids.clear()
+        self.region_ids.clear()
+        self._object_spatial_index.clear()
+        self._step_counter = 0
+        self._dirty = False
+
     def _new_id(self, prefix: str) -> str: # UUID 기반 고유 ID 생성 
         """Generate new unique ID."""
         return f"{prefix}_{uuid.uuid4().hex[:8]}"
@@ -640,7 +655,7 @@ class PoseGraph:
             
             # Remove object if confidence is too low after multiple observations
             min_observations_for_check = 2
-            min_confidence_threshold = 0.8
+            min_confidence_threshold = 0.85 # 다중 관측
             if (updated_obj.num_observations >= min_observations_for_check and
                 updated_obj.confidence < min_confidence_threshold):
                 self._remove_object_node(updated_obj.id)

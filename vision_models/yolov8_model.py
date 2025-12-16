@@ -44,6 +44,37 @@ class YoloV8Detector:
 
         return preds
 
+    def detect_all(self,
+                   image: np.ndarray,
+                   confidence_threshold: float = None
+                   ):
+        """
+        Detect all COCO classes (not just target class).
+        Returns all detections with class names.
+        """
+        if confidence_threshold is None:
+            confidence_threshold = self.confidence_threshold
+            
+        image = np.flip(image, axis=-1)  # to bgr
+        results = self.model(image, verbose=False)[0]
+        preds = {
+            "boxes": [],
+            "scores": [],
+            "class_names": [],
+            "class_ids": []
+        }
+        boxes = results.boxes
+        for bbox, cls, conf in zip(boxes.xyxy, boxes.cls, boxes.conf):
+            if conf > confidence_threshold:
+                class_id = int(cls)
+                class_name = COCO_CLASSES[class_id]
+                preds["boxes"].append([bbox[0].item(), bbox[1].item(), bbox[2].item(), bbox[3].item()])
+                preds["scores"].append(conf.item())
+                preds["class_names"].append(class_name)
+                preds["class_ids"].append(class_id)
+
+        return preds
+
 
 if __name__ == "__main__":
     from PIL import Image

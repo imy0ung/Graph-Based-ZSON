@@ -115,6 +115,74 @@ class YOLOv7Detector:
         print(f"YOLO forward: {time.time() - a}")
         return preds
 
+    def detect_all(self,
+                   image: np.ndarray,
+                   confidence_threshold: float = None
+                   ):
+        """
+        Detect all COCO classes (not just target class).
+        Returns all detections with class names.
+        """
+        if confidence_threshold is None:
+            confidence_threshold = self.confidence_threshold
+            
+        orig_shape = image.shape
+
+        img = cv2.resize(
+             image,
+             (self.image_size, int(self.image_size * 0.7)),
+             interpolation=cv2.INTER_AREA,
+        )
+        img = letterbox(img, new_shape=self.image_size)[0]
+        img = img.transpose(2, 0, 1)
+        img = np.ascontiguousarray(img)
+
+        img = torch.from_numpy(img).to("cuda")
+
+        img = img.half() if self.half_precision else img.float()
+        img /= 255.0
+        if img.ndimension() == 3:
+            img = img.unsqueeze(0)
+
+        # Inference
+        with torch.inference_mode():
+            pred = self.model(img)[0]
+
+        # Apply NMS - detect all classes_oi (not just target)
+        pred = non_max_suppression(
+            pred,
+            0.25,
+            0.45,
+            classes=self.classes_oi,
+            agnostic=False,
+        )[0]
+        
+        if len(pred) == 0:
+            return {"boxes": [], "scores": [], "class_names": []}
+            
+        # Rescale boxes from img_size to im0 size
+        pred[:, :4] = scale_coords(img.shape[2:], pred[:, :4], orig_shape).round()
+        pred[:, 0] = torch.clip(pred[:, 0], 0, orig_shape[1] - 1)
+        pred[:, 1] = torch.clip(pred[:, 1], 0, orig_shape[0] - 1)
+        pred[:, 2] = torch.clip(pred[:, 2], 0, orig_shape[1] - 1)
+        pred[:, 3] = torch.clip(pred[:, 3], 0, orig_shape[0] - 1)
+        
+        boxes = pred[:, :4]
+        logits = pred[:, 4]
+        
+        preds = {"boxes": [], "scores": [], "class_names": []}
+        for i in range(pred.shape[0]):
+            if logits[i] > confidence_threshold:
+                box = boxes[i]
+                if not (box[0].item() == box[2].item() or box[1].item() == box[3].item()):
+                    class_name = COCO_CLASSES[int(pred[i, 5])]
+                    # Return original COCO class name (navigator.py will handle mapping)
+                    preds["boxes"].append([box[0].item(), box[1].item(), box[2].item(), box[3].item()])
+                    preds["scores"].append(float(logits[i]))
+                    preds["class_names"].append(class_name)
+        
+        return preds
+
 if __name__ == "__main__":
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)

@@ -28,7 +28,7 @@ from mapping import Navigator
 from mapping import Frontier
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
-from vision_models.yolov8_model import YoloV8Detector
+from vision_models.yolov7_model import YOLOv7Detector
 
 # from onemap_utils import log_map_rerun
 from planning import Planning, Controllers
@@ -54,13 +54,17 @@ if __name__ == "__main__":
     model = ClipModel("weights/clip.pth")
     # Target object detector (for navigation)
     #detector = YOLOWorldDetector(0.8)
-    detector = YoloV8Detector(0.8)
+    detector = YOLOv7Detector(0.8)
     mapper = Navigator(model, detector, config)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
+
+    mapper.debug_observation_distance = True
+    mapper.pose_graph.debug_map_logging = True
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["tv", "couch", "toilet", "bed"]
+    qs =["tv", "couch", "toilet", "chair", "bed"]
+    #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
@@ -211,7 +215,7 @@ if __name__ == "__main__":
                     print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
         
         # Print graph statistics periodically
-        if mapper.pose_graph._step_counter % 50 == 0:
+        if mapper.pose_graph._step_counter % 10 == 0:
             stats = mapper.pose_graph.get_statistics()
             print(f"\n[Step {mapper.pose_graph._step_counter}] Graph Stats:")
             print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "

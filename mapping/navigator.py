@@ -12,7 +12,6 @@ from mapping import (OneMap, PoseGraph, PoseNode, FrontierNode, detect_frontiers
 from planning import Planning
 from vision_models.base_model import BaseModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
-from vision_models.yolov8_model import YoloV8Detector
 from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 from config import Conf, load_config
 from config import SpotControllerConf
@@ -135,14 +134,7 @@ class Navigator:
 
         # Models
         self.model = model
-        self.detector = detector  # Target object detector (YOLOWorldDetector)
-        # COCO object detector for pose graph registration
-        try:
-            self.coco_detector = YoloV8Detector(confidence_threshold=0.8)
-            self.coco_detector.set_classes(None)  # Detect all COCO classes
-        except Exception as e:
-            print(f"Warning: Could not initialize COCO detector: {e}")
-            self.coco_detector = None
+        self.detector = detector  # Single YOLO detector for both target and COCO detection
         sam_model_t = "vit_t"
         sam_checkpoint = "weights/mobile_sam.pt"
         self.sam = sam_model_registry[sam_model_t](checkpoint=sam_checkpoint)
@@ -153,9 +145,8 @@ class Navigator:
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
         
         # Initialize pose graph with database support
-        db_path = getattr(config, 'pose_graph_db_path', 'pose_graph.db')
-        session_name = getattr(config, 'session_name', f"session_{int(time.time())}")
-        self.pose_graph = PoseGraph(db_path=db_path, session_name=session_name)
+        # DB 저장 비활성화 (평가 시 인메모리만 사용)
+        self.pose_graph = PoseGraph(db_path=None, session_name=None)
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
@@ -271,6 +262,8 @@ class Navigator:
         self.blacklisted_nav_goals = []
         self.artificial_obstacles = []
         self.frontier_node_map = {}  # Reset frontier node mapping
+        # Clear pose graph for fair evaluation (each episode starts fresh)
+        self.pose_graph.clear()
 
     def set_camera_matrix(self,
                           camera_matrix: np.ndarray
@@ -879,12 +872,37 @@ class Navigator:
         rgb_image = image.transpose(1, 2, 0)
         sam_image_set = False
 
-        # Target object detection (for navigation)
-        detections = self.detector.detect(rgb_image)
+        # Single YOLO detection for both target object and pose graph registration
+        # detect_all() returns all COCO classes with class_names
+        all_detections = self.detector.detect_all(rgb_image, confidence_threshold=0.8)
         
-        # COCO object detection for pose graph registration (runs every frame)
-        if self.coco_detector is not None:
-            coco_detections = self.coco_detector.detect(rgb_image)
+        # Map COCO class names to standardized names using class_map
+        # e.g., "tv_monitor" -> "tv", "couch" -> "couch"
+        if "class_names" in all_detections:
+            mapped_class_names = []
+            for class_name in all_detections["class_names"]:
+                # Map COCO class to standardized name
+                mapped_name = self.class_map.get(class_name.lower(), class_name.lower())
+                mapped_class_names.append(mapped_name)
+            all_detections["class_names"] = mapped_class_names
+        
+        # Filter for target object detection (for navigation)
+        target_class = self.query_text[0].lower() if self.query_text else None
+        detections = {"boxes": [], "scores": []}
+        if target_class and "class_names" in all_detections:
+            # Map target class to standardized name
+            target_mapped = self.class_map.get(target_class, target_class)
+            for box, score, class_name in zip(all_detections["boxes"], 
+                                               all_detections["scores"], 
+                                               all_detections["class_names"]):
+                # Match if mapped class_name matches target (both are now standardized)
+                if class_name.lower() == target_mapped or class_name.lower() == target_class:
+                    detections["boxes"].append(box)
+                    detections["scores"].append(score)
+        
+        # Use all detections for pose graph registration
+        coco_detections = all_detections
+        if True:  # Always run pose graph registration
             current_pose_id = self.pose_graph.pose_ids[-1] if self.pose_graph.pose_ids else None
             mask_overlay_ids = np.zeros(depth.shape, dtype=np.uint16) if self.log else None
             mask_annotation_infos: List[rr.AnnotationInfo] = []
@@ -994,6 +1012,7 @@ class Navigator:
                         if mask_annotation_infos:
                             rr.log("camera/rgb/mask_annotations", rr.AnnotationContext(mask_annotation_infos))
                         rr.log("camera/rgb/masks", rr.SegmentationImage(mask_overlay_ids))
+                    
                     self.pose_graph.add_object_nodes_batch(
                         pose_id=current_pose_id,
                         observations=observations,
