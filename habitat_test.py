@@ -63,7 +63,7 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["sofa","chair","bed","toilet"]
+    qs =["toilet", "bed", "couch"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"

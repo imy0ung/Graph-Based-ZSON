@@ -300,92 +300,80 @@ class Navigator:
     def compute_clip_verification_score(
         self, 
         image_crop: np.ndarray, 
-        detected_label: str
-    ) -> float:
+        detected_label: str,
+        mask_crop: Optional[np.ndarray] = None,
+    ) -> Optional[float]:
         """
-        탐지된 라벨이 실제로 맞는지 CLIP으로 검증.
-        탐지된 라벨과 혼동 가능한 클래스들을 비교하여 점수 계산.
+        Verify that a detected label matches the image region using CLIP cosine similarity.
+        Uses SAM mask-based pooling when `mask_crop` is provided to reduce background influence.
         
         Args:
             image_crop: 탐지된 영역의 이미지 crop [H, W, C] (RGB)
             detected_label: YOLO가 탐지한 라벨
+            mask_crop: Optional boolean mask [H, W] aligned with `image_crop` (True for object pixels)
         
         Returns:
-            탐지된 라벨에 대한 CLIP 유사도 점수 (0~1)
+            CLIP cosine similarity score (roughly in [-1, 1]) or None if unavailable
         """
-        # 혼동 가능한 클래스들 정의
-        confusable_classes = {
-            "toilet": ["toilet", "washing machine", "dryer", "sink", "bathtub"],
-            "couch": ["couch", "sofa", "chair", "bed", "armchair"],
-            "sofa": ["sofa", "couch", "chair", "bed", "armchair"],
-            "bed": ["bed", "sofa", "couch", "mattress"],
-            "chair": ["chair", "couch", "sofa", "stool", "bench"],
-            "tv": ["tv", "monitor", "computer screen", "laptop"],
-            "refrigerator": ["refrigerator", "cabinet", "wardrobe", "closet"],
-            "potted plant": ["potted plant", "vase", "flower", "decoration"],
-            "dining table": ["dining table", "desk", "counter", "shelf"],
-            "sink": ["sink", "bathtub", "toilet", "basin"],
-        }
-        
-        # 해당 라벨의 후보 클래스들 가져오기
-        candidates = confusable_classes.get(detected_label, [detected_label])
-        
-        # 탐지된 라벨이 candidates에 없으면 추가
-        if detected_label not in candidates:
-            candidates = [detected_label] + candidates
-        
         try:
             # 이미지 crop 전처리 (CLIP 모델 입력 형식으로)
             # image_crop은 [H, W, C] 형식
             if image_crop.shape[0] < 10 or image_crop.shape[1] < 10:
                 # 너무 작은 crop은 신뢰할 수 없음
-                return 0.5
+                return None
             
             # [H, W, C] -> [C, H, W]로 변환
             image_for_clip = image_crop.transpose(2, 0, 1)
             
-            # CLIP으로 텍스트 특징 추출 (각 후보 클래스별)
-            text_prompts = [f"a {c}" for c in candidates]
-            text_features = self.model.get_text_features(text_prompts)  # [num_candidates, 768]
+            # CLIP으로 텍스트 특징 추출 (단일 라벨)
+            text_prompt = f"a {detected_label}"
+            text_features = self.model.get_text_features([text_prompt])  # [1, F]
             
             # CLIP으로 이미지 특징 추출 (dense feature map)
-            image_features = self.model.get_image_features(image_for_clip[np.newaxis, ...])  # [1, 768, H', W']
+            image_features = self.model.get_image_features(image_for_clip[np.newaxis, ...])  # [1, F, H', W']
             
-            # Dense feature를 global feature로 변환 (spatial average pooling)
-            # [1, 768, H', W'] -> [1, 768]
-            image_features_global = image_features.mean(dim=(2, 3))  # spatial average
+            # Mask-based pooling in feature space (reduces background influence)
+            if mask_crop is not None and mask_crop.size > 0:
+                mask_bool = mask_crop.astype(bool)
+                if mask_bool.any():
+                    mask_t = torch.from_numpy(mask_bool.astype(np.float32))[None, None, ...]  # [1,1,H,W]
+                    mask_t = torch.nn.functional.interpolate(
+                        mask_t,
+                        size=(image_features.shape[2], image_features.shape[3]),
+                        mode="nearest",
+                    ).to(image_features.device)  # [1,1,Hf,Wf]
+                    weights = mask_t.squeeze(0).squeeze(0)  # [Hf,Wf]
+                    denom = weights.sum()
+                    if float(denom) > 1.0:
+                        pooled = (image_features[0] * weights.unsqueeze(0)).sum(dim=(1, 2)) / denom
+                        image_features_global = pooled.unsqueeze(0)
+                    else:
+                        image_features_global = image_features.mean(dim=(2, 3))
+                else:
+                    image_features_global = image_features.mean(dim=(2, 3))
+            else:
+                image_features_global = image_features.mean(dim=(2, 3))
+
             image_features_global = torch.nn.functional.normalize(image_features_global, dim=1)
             
-            # 각 텍스트 후보와의 유사도 계산 (cosine similarity)
-            # image: [1, 768], text: [num_candidates, 768] -> [1, num_candidates]
-            similarities = torch.mm(image_features_global, text_features.t())
-            similarities = similarities.squeeze(0).cpu().numpy()  # [num_candidates]
-            
-            # Softmax로 정규화 (temperature scaling으로 더 sharp한 분포)
-            temperature = 0.1
-            exp_sim = np.exp((similarities - np.max(similarities)) / temperature)
-            probs = exp_sim / exp_sim.sum()
-            
-            # 탐지된 라벨의 확률 반환
-            target_idx = candidates.index(detected_label)
-            clip_score = float(probs[target_idx])
-            
-            return clip_score
+            # Cosine similarity (since both are normalized)
+            similarity = torch.mm(image_features_global, text_features.t()).squeeze(0).squeeze(0)
+            return float(similarity.detach().cpu().item())
             
         except Exception as e:
-            # 오류 발생 시 중립적인 점수 반환
+            # 오류 발생 시 점수 미사용
             print(f"[CLIP Verification] Error: {e}")
             import traceback
             traceback.print_exc()
-            return 0.5
+            return None
 
     def find_target_object_in_graph(
         self,
         robot_x: float,
         robot_y: float,
         min_confidence: float = 0.8,
-        min_observations: int = 2,
-        min_clip_score: float = 0.23,  # CLIP 검증 최소 점수
+        min_observations: int = 1,
+        min_clip_score: float = 0.05,  # CLIP 검증 최소 점수
     ) -> Optional[Tuple[np.ndarray, Any]]:
         """
         PoseGraph에서 쿼리 텍스트에 매칭되는 가장 가까운 객체 검색.
@@ -397,7 +385,7 @@ class Navigator:
             robot_y: 로봇 y 좌표 (metric)
             min_confidence: 최소 신뢰도 임계값 (기본값 0.5, 제거 임계값 0.8보다 낮게 설정)
             min_observations: 최소 관측 횟수 (노이즈 필터링)
-            min_clip_score: 최소 CLIP 검증 점수 (0~1, 이 값 미만은 오탐지로 간주)
+            min_clip_score: 최소 CLIP cosine similarity (이 값 미만은 오탐지로 간주)
         
         Returns:
             (목표 픽셀 좌표 [px, py], ObjectNode) 또는 None
@@ -426,7 +414,7 @@ class Navigator:
         for target_obj, distance in candidates:
             # CLIP 검증 점수 확인 (오탐지 필터링)
             avg_clip = target_obj.avg_clip_score
-            if avg_clip > 0 and avg_clip < min_clip_score:
+            if target_obj.clip_scores and avg_clip < min_clip_score:
                 # CLIP 점수가 너무 낮음 → 오탐지 가능성 높음
                 print(f"[CLIP Filter] Rejected '{target_obj.label}' at "
                       f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
@@ -973,23 +961,32 @@ class Navigator:
                                 current_pose = self.pose_graph.nodes[current_pose_id]
                                 assert isinstance(current_pose, PoseNode)
                                 yaw = current_pose.theta
-                                
-                                # Convert world position to camera pixel coordinates
-                                pixel_coords = self._world_to_camera_pixel(
-                                    position_w,
-                                    self.current_depth,
-                                    yaw,
-                                    self.current_odometry
+
+                                # Robust frontier embedding: aggregate multiple samples along the frontier contour
+                                coarse_embedding = self._extract_frontier_coarse_embedding(
+                                    frontier=frontier,
+                                    yaw=yaw,
+                                    max_samples=32,
+                                    patch_radius=1,
+                                    depth_consistency=True,
                                 )
-                                
-                                if pixel_coords is not None:
-                                    pixel_x, pixel_y = pixel_coords
-                                    # Extract feature at this pixel location
-                                    coarse_embedding = self._extract_image_feature_at_pixel(
-                                        self.current_image_features,
-                                        pixel_x,
-                                        pixel_y
+
+                                # Fallback: if aggregation fails, try midpoint patch feature
+                                if coarse_embedding is None:
+                                    pixel_coords = self._world_to_camera_pixel(
+                                        position_w,
+                                        self.current_depth,
+                                        yaw,
+                                        self.current_odometry
                                     )
+                                    if pixel_coords is not None:
+                                        pixel_x, pixel_y = pixel_coords
+                                        coarse_embedding = self._extract_image_feature_patch(
+                                            self.current_image_features,
+                                            pixel_x,
+                                            pixel_y,
+                                            patch_radius=1,
+                                        )
                             
                             # Add frontier node to pose graph
                             fr_node = self.pose_graph.add_frontier_node(
@@ -1129,6 +1126,7 @@ class Navigator:
                                                                         coco_detections["class_names"])):
                     position_w = None
                     pixel_center = None
+                    mask_bool = None
                     try:
                         masks, _, _ = self.sam_predictor.predict(
                             point_coords=None,
@@ -1191,11 +1189,21 @@ class Navigator:
                             
                             if x2 > x1 + 10 and y2 > y1 + 10:  # 최소 크기 확인
                                 image_crop = rgb_image[y1:y2, x1:x2]  # [H, W, C]
-                                clip_score = self.compute_clip_verification_score(image_crop, class_name)
+                                mask_crop = None
+                                if mask_bool is not None:
+                                    mask_crop = mask_bool[y1:y2, x1:x2]
+                                clip_score = self.compute_clip_verification_score(
+                                    image_crop=image_crop,
+                                    detected_label=class_name,
+                                    mask_crop=mask_crop,
+                                )
                                 
                                 # 디버그 출력 (매 100 스텝마다)
                                 if self.pose_graph._step_counter % 100 == 0:
-                                    print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP={clip_score:.3f}")
+                                    if clip_score is None:
+                                        print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP=None")
+                                    else:
+                                        print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP_cos={clip_score:.3f}")
                         except Exception as e:
                             if self.pose_graph._step_counter % 100 == 0:
                                 print(f"[CLIP Verify] Error for {class_name}: {e}")
@@ -1395,6 +1403,168 @@ class Navigator:
         if 0 <= pixel_x < depth.shape[1] and 0 <= pixel_y < depth.shape[0]:
             return (pixel_x, pixel_y)
         return None
+
+    def _world_to_camera_pixel_with_depth(
+        self,
+        world_pos: np.ndarray,
+        depth: np.ndarray,
+        yaw: float,
+        odometry: np.ndarray,
+    ) -> Optional[Tuple[int, int, float]]:
+        """
+        Like `_world_to_camera_pixel`, but also returns the expected depth (x_cam) for depth-consistency checks.
+        """
+        world_x = world_pos[0] - odometry[0, 3]
+        world_y = world_pos[1] - odometry[1, 3]
+        world_z = world_pos[2] - odometry[2, 3] if len(world_pos) > 2 else 0.0
+
+        cos_yaw = np.cos(-yaw)
+        sin_yaw = np.sin(-yaw)
+        r_inv = np.array([[cos_yaw, -sin_yaw],
+                          [sin_yaw, cos_yaw]])
+
+        cam_local_2d = np.dot(r_inv, np.array([world_x, world_y]))
+
+        x_cam = float(np.sqrt(cam_local_2d[0]**2 + cam_local_2d[1]**2))
+        y_cam = -cam_local_2d[1]
+        z_cam = -world_z
+
+        if x_cam <= 0 or x_cam > 10.0:
+            return None
+
+        pixel_x = int(-y_cam * self.one_map.fx / x_cam + self.one_map.cx)
+        pixel_y = int(-z_cam * self.one_map.fy / x_cam + self.one_map.cy)
+
+        if 0 <= pixel_x < depth.shape[1] and 0 <= pixel_y < depth.shape[0]:
+            return (pixel_x, pixel_y, x_cam)
+        return None
+
+    def _pixel_to_feature_coords(
+        self,
+        image_features: torch.Tensor,
+        pixel_x: int,
+        pixel_y: int,
+    ) -> Optional[Tuple[int, int]]:
+        feat_h, feat_w = image_features.shape[1], image_features.shape[2]
+
+        if self.current_image is not None:
+            img_h, img_w = self.current_image.shape[1], self.current_image.shape[2]
+        elif self.current_depth is not None:
+            img_h, img_w = self.current_depth.shape[0], self.current_depth.shape[1]
+        else:
+            return None
+
+        feat_x = int(pixel_x * feat_w / img_w)
+        feat_y = int(pixel_y * feat_h / img_h)
+        if 0 <= feat_x < feat_w and 0 <= feat_y < feat_h:
+            return feat_x, feat_y
+        return None
+
+    def _extract_image_feature_patch(
+        self,
+        image_features: torch.Tensor,
+        pixel_x: int,
+        pixel_y: int,
+        patch_radius: int = 1,
+    ) -> Optional[np.ndarray]:
+        """
+        Extract a pooled feature from a (2*patch_radius+1)^2 neighborhood on the feature map.
+        This is more robust than sampling a single pixel feature.
+        """
+        coords = self._pixel_to_feature_coords(image_features, pixel_x, pixel_y)
+        if coords is None:
+            return None
+        feat_x, feat_y = coords
+
+        feat_h, feat_w = image_features.shape[1], image_features.shape[2]
+        x0 = max(0, feat_x - patch_radius)
+        x1 = min(feat_w, feat_x + patch_radius + 1)
+        y0 = max(0, feat_y - patch_radius)
+        y1 = min(feat_h, feat_y + patch_radius + 1)
+        patch = image_features[:, y0:y1, x0:x1]
+        if patch.numel() == 0:
+            return None
+        pooled = patch.mean(dim=(1, 2)).cpu().numpy()
+        return pooled
+
+    def _extract_frontier_coarse_embedding(
+        self,
+        frontier: np.ndarray,
+        yaw: float,
+        max_samples: int = 32,
+        patch_radius: int = 1,
+        depth_consistency: bool = True,
+    ) -> Optional[np.ndarray]:
+        """
+        Build a robust embedding for a frontier by aggregating features from multiple projected samples.
+
+        Sampling strategy:
+        - Sample up to `max_samples` points evenly along the frontier contour (map pixels).
+        - Project each point into the current camera view.
+        - Optionally filter samples with a depth-consistency check.
+        - Extract a pooled patch feature per valid sample.
+        - Average and L2-normalize.
+        """
+        if self.current_image_features is None or self.current_depth is None or self.current_odometry is None:
+            return None
+
+        points_px = frontier.reshape(-1, 2)
+        if points_px.shape[0] < 2:
+            return None
+
+        num = int(min(max_samples, points_px.shape[0]))
+        sample_indices = np.linspace(0, points_px.shape[0] - 1, num=num, dtype=np.int32)
+        sample_indices = np.unique(
+            np.concatenate(
+                [sample_indices, np.array([points_px.shape[0] // 2], dtype=np.int32)]
+            )
+        )
+
+        features: List[np.ndarray] = []
+        for idx in sample_indices:
+            px_f, py_f = points_px[int(idx)]
+            px = int(np.round(px_f))
+            py = int(np.round(py_f))
+
+            x_world, y_world = self.one_map.px_to_metric(px, py)
+            position_w = np.array([x_world, y_world, 0.0], dtype=np.float32)
+
+            proj = self._world_to_camera_pixel_with_depth(
+                position_w,
+                self.current_depth,
+                yaw,
+                self.current_odometry,
+            )
+            if proj is None:
+                continue
+            pixel_x, pixel_y, expected_depth = proj
+
+            if depth_consistency:
+                depth_px = self.current_depth[pixel_y, pixel_x]
+                measured = float(depth_px) if np.ndim(depth_px) == 0 else float(depth_px[0])
+                if not np.isfinite(measured) or measured <= 0:
+                    continue
+                tol = max(0.5, 0.25 * float(expected_depth))
+                if abs(measured - float(expected_depth)) > tol:
+                    continue
+
+            feat = self._extract_image_feature_patch(
+                self.current_image_features,
+                pixel_x,
+                pixel_y,
+                patch_radius=patch_radius,
+            )
+            if feat is not None:
+                features.append(feat)
+
+        if len(features) == 0:
+            return None
+
+        emb = np.mean(np.stack(features, axis=0), axis=0)
+        norm = float(np.linalg.norm(emb))
+        if norm > 1e-8:
+            emb = emb / norm
+        return emb
     
     def _extract_image_feature_at_pixel(
         self,
@@ -1413,30 +1583,12 @@ class Navigator:
         Returns:
             Feature vector [F] if valid, None otherwise
         """
-        # Get feature map dimensions
-        feat_h, feat_w = image_features.shape[1], image_features.shape[2]
-        
-        # Scale pixel coordinates to feature map coordinates
-        # Assuming image_features are from CLIP dense model
-        # Need to know original image size - use current_image if available
-        if self.current_image is not None:
-            img_h, img_w = self.current_image.shape[1], self.current_image.shape[2]
-            feat_x = int(pixel_x * feat_w / img_w)
-            feat_y = int(pixel_y * feat_h / img_h)
-        else:
-            # Fallback: assume feature map is same size as depth
-            if self.current_depth is not None:
-                img_h, img_w = self.current_depth.shape[0], self.current_depth.shape[1]
-                feat_x = int(pixel_x * feat_w / img_w)
-                feat_y = int(pixel_y * feat_h / img_h)
-            else:
-                return None
-        
-        # Check bounds
-        if 0 <= feat_x < feat_w and 0 <= feat_y < feat_h:
-            feature = image_features[:, feat_y, feat_x].cpu().numpy()
-            return feature
-        return None
+        coords = self._pixel_to_feature_coords(image_features, pixel_x, pixel_y)
+        if coords is None:
+            return None
+        feat_x, feat_y = coords
+        feature = image_features[:, feat_y, feat_x].cpu().numpy()
+        return feature
 
     def _compute_world_center_from_mask(
         self,

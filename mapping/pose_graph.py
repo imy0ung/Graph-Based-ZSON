@@ -166,7 +166,7 @@ class ObjectNode(BaseNode):
     @property
     def clip_verified(self) -> bool:
         """CLIP 검증 통과 여부 (임계값 0.3 이상이면 신뢰)"""
-        return self.avg_clip_score >= 0.23
+        return self.avg_clip_score >= 0.05
 
 
 @dataclass
@@ -755,7 +755,7 @@ class PoseGraph:
             
             # Remove object if confidence is too low after multiple observations
             min_observations_for_check = 2
-            min_confidence_threshold = 0.85 # 다중 관측
+            min_confidence_threshold = 0.8 # 다중 관측
             if (updated_obj.num_observations >= min_observations_for_check and
                 updated_obj.confidence < min_confidence_threshold):
                 self._remove_object_node(updated_obj.id)
