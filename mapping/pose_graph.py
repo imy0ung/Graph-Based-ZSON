@@ -39,6 +39,16 @@ def normalize_embedding(x: Optional[np.ndarray]) -> Optional[np.ndarray]:
     return x / norm
 
 
+def cosine_similarity_np(a: Optional[np.ndarray], b: Optional[np.ndarray]) -> Optional[float]:
+    """Return cosine similarity between two vectors."""
+    if a is None or b is None:
+        return None
+    denom = (np.linalg.norm(a) * np.linalg.norm(b))
+    if denom < 1e-8:
+        return None
+    return float(np.dot(a, b) / denom)
+
+
 def world_to_local_2d(pose_x: float, pose_y: float, pose_theta: float,
                       world_x: float, world_y: float) -> np.ndarray:
     # Translate to pose origin
@@ -140,10 +150,23 @@ class ObjectNode(BaseNode):
     position: np.ndarray        # (3,) world 좌표
     confidence: float
     embedding: Optional[np.ndarray] = None  # global CLIP embedding 등
+    best_view_score: float = float("-inf")  # 가장 좋은 뷰 스코어(높을수록 좋음)
     num_observations: int = 1
     last_seen_step: int = 0
     # Kalman filter state (for improved matching)
     position_covariance: np.ndarray = field(default_factory=lambda: np.eye(2) * 0.1)  # (2,2) covariance for x,y
+    # CLIP 검증 점수: 탐지된 라벨이 실제로 맞는지 검증한 점수들 (누적)
+    clip_scores: List[float] = field(default_factory=list)
+    
+    @property
+    def avg_clip_score(self) -> float:
+        """평균 CLIP 검증 점수 반환"""
+        return float(np.mean(self.clip_scores)) if self.clip_scores else 0.0
+    
+    @property
+    def clip_verified(self) -> bool:
+        """CLIP 검증 통과 여부 (임계값 0.3 이상이면 신뢰)"""
+        return self.avg_clip_score >= 0.23
 
 
 @dataclass
@@ -514,6 +537,77 @@ class PoseGraph:
         
         return best_match
     
+    def find_nearby_objects_by_embedding(
+        self,
+        position_w: np.ndarray,
+        embedding: Optional[np.ndarray],
+        distance_threshold: float = 3.0,
+        use_kalman: bool = True,
+        mahalanobis_threshold: float = 3.0,
+        sim_threshold: float = 0.3,
+        max_candidates: int = 50,
+    ) -> Tuple[Optional[ObjectNode], Optional[float]]:
+        """
+        라벨 없이 임베딩+거리 기반으로 근처 객체를 탐색.
+
+        Returns:
+            (best_match, best_sim) 혹은 (None, None)
+        """
+        if embedding is None:
+            return None, None
+
+        observed_pos_2d = position_w[:2]
+        nearby_cells = self._get_nearby_grid_cells(position_w[0], position_w[1], distance_threshold)
+
+        candidate_ids: set = set()
+        for cell in nearby_cells:
+            for label_cells in self._object_spatial_index.values():
+                if cell in label_cells:
+                    candidate_ids.update(label_cells[cell])
+            if len(candidate_ids) >= max_candidates:
+                break
+
+        best_match: Optional[ObjectNode] = None
+        best_sim: float = -1.0
+
+        for obj_id in list(candidate_ids)[:max_candidates]:
+            if obj_id not in self.nodes:
+                continue
+            obj_node = self.nodes[obj_id]
+            if not isinstance(obj_node, ObjectNode):
+                continue
+            if obj_node.embedding is None:
+                continue
+
+            euclidean_dist = np.linalg.norm(observed_pos_2d - obj_node.position[:2])
+
+            # Kalman/Mahalanobis gating if available
+            if use_kalman and obj_node.num_observations > 1:
+                steps_since_last_seen = self._step_counter - obj_node.last_seen_step
+                predicted_pos = self._predict_object_position(obj_node, steps_since_last_seen)
+                mahal_dist = self._calculate_mahalanobis_distance(
+                    observed_pos_2d,
+                    predicted_pos,
+                    obj_node.position_covariance
+                )
+                if not (mahal_dist < mahalanobis_threshold or euclidean_dist < distance_threshold):
+                    continue
+            else:
+                if euclidean_dist >= distance_threshold:
+                    continue
+
+            sim = cosine_similarity_np(embedding, obj_node.embedding)
+            if sim is None:
+                continue
+            if sim >= sim_threshold and sim > best_sim:
+                best_sim = sim
+                best_match = obj_node
+
+        if best_sim < sim_threshold:
+            return None, None
+
+        return best_match, best_sim
+    
     def update_object_node(
         self,
         obj_node: ObjectNode,
@@ -619,6 +713,7 @@ class PoseGraph:
         embedding: Optional[np.ndarray] = None,
         step: Optional[int] = None,
         distance_threshold: float = 3.0,
+        clip_score: Optional[float] = None,  # CLIP 검증 점수 (탐지 라벨이 맞는지 검증)
     ) -> ObjectNode:
         """
         객체 노드를 추가하거나, 근처에 발견된 객체의 중심점을 이용해 칼만필터 업데이트
@@ -634,6 +729,7 @@ class PoseGraph:
             embedding: Optional embedding
             step: Current step number
             distance_threshold: Distance threshold for matching (meters)
+            clip_score: CLIP verification score (how confident CLIP is that the label is correct)
         
         Returns:
             ObjectNode (new or updated)
@@ -652,6 +748,10 @@ class PoseGraph:
                 embedding,
                 step or self._step_counter,
             )
+            
+            # CLIP 점수 누적
+            if clip_score is not None:
+                updated_obj.clip_scores.append(clip_score)
             
             # Remove object if confidence is too low after multiple observations
             min_observations_for_check = 2
@@ -683,6 +783,7 @@ class PoseGraph:
                 num_observations=1,
                 last_seen_step=step or self._step_counter,
                 position_covariance=np.eye(2) * 0.1,  # Initial covariance
+                clip_scores=[clip_score] if clip_score is not None else [],  # CLIP 검증 점수 초기화
             )
             self._add_node(obj_node)
 
@@ -733,6 +834,7 @@ class PoseGraph:
                 - position_w: np.ndarray (3,)
                 - confidence: float
                 - embedding: Optional[np.ndarray]
+                - clip_score: Optional[float] (CLIP 검증 점수)
             step: Current step number
             distance_threshold: Maximum Euclidean distance threshold (meters)
             use_kalman: Whether to use Kalman filter prediction
@@ -758,6 +860,7 @@ class PoseGraph:
                 embedding=obs.get("embedding"),
                 step=step or self._step_counter,
                 distance_threshold=distance_threshold,
+                clip_score=obs.get("clip_score"),  # CLIP 검증 점수 전달
             )
             results.append(obj_node)
         

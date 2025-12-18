@@ -63,7 +63,7 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["tv", "couch", "toilet", "chair", "bed"]
+    qs =["sofa","chair","bed","toilet"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
@@ -227,8 +227,11 @@ if __name__ == "__main__":
                 print(f"  Registered Objects:")
                 for obj_id in mapper.pose_graph.object_ids:
                     obj_node = mapper.pose_graph.nodes[obj_id]
-                    print(f"    - {obj_node.label}: pos=({obj_node.position[0]:.2f}, {obj_node.position[1]:.2f}), "
-                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}")
+                    # CLIP 검증 점수 출력 추가
+                    clip_info = f", clip={obj_node.avg_clip_score:.3f}" if obj_node.clip_scores else ", clip=N/A"
+                    verified_mark = "✓" if obj_node.clip_verified else "✗" if obj_node.clip_scores else "?"
+                    print(f"    - {obj_node.label} [{verified_mark}]: pos=({obj_node.position[0]:.2f}, {obj_node.position[1]:.2f}), "
+                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}{clip_info}")
         
         # Print target object info if navigating to graph-based target
         if mapper.target_object_node is not None:

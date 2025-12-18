@@ -20,6 +20,9 @@ from mobile_sam import sam_model_registry, SamPredictor
 # numpy
 import numpy as np
 
+# scipy
+from scipy.stats import rankdata
+
 # typing
 from typing import List, Optional, Set, Any, Union, Tuple
 
@@ -294,15 +297,99 @@ class Navigator:
             self.target_object_node = None  # Reset target object node
             self.path = None  # Clear path to allow new exploration
 
+    def compute_clip_verification_score(
+        self, 
+        image_crop: np.ndarray, 
+        detected_label: str
+    ) -> float:
+        """
+        탐지된 라벨이 실제로 맞는지 CLIP으로 검증.
+        탐지된 라벨과 혼동 가능한 클래스들을 비교하여 점수 계산.
+        
+        Args:
+            image_crop: 탐지된 영역의 이미지 crop [H, W, C] (RGB)
+            detected_label: YOLO가 탐지한 라벨
+        
+        Returns:
+            탐지된 라벨에 대한 CLIP 유사도 점수 (0~1)
+        """
+        # 혼동 가능한 클래스들 정의
+        confusable_classes = {
+            "toilet": ["toilet", "washing machine", "dryer", "sink", "bathtub"],
+            "couch": ["couch", "sofa", "chair", "bed", "armchair"],
+            "sofa": ["sofa", "couch", "chair", "bed", "armchair"],
+            "bed": ["bed", "sofa", "couch", "mattress"],
+            "chair": ["chair", "couch", "sofa", "stool", "bench"],
+            "tv": ["tv", "monitor", "computer screen", "laptop"],
+            "refrigerator": ["refrigerator", "cabinet", "wardrobe", "closet"],
+            "potted plant": ["potted plant", "vase", "flower", "decoration"],
+            "dining table": ["dining table", "desk", "counter", "shelf"],
+            "sink": ["sink", "bathtub", "toilet", "basin"],
+        }
+        
+        # 해당 라벨의 후보 클래스들 가져오기
+        candidates = confusable_classes.get(detected_label, [detected_label])
+        
+        # 탐지된 라벨이 candidates에 없으면 추가
+        if detected_label not in candidates:
+            candidates = [detected_label] + candidates
+        
+        try:
+            # 이미지 crop 전처리 (CLIP 모델 입력 형식으로)
+            # image_crop은 [H, W, C] 형식
+            if image_crop.shape[0] < 10 or image_crop.shape[1] < 10:
+                # 너무 작은 crop은 신뢰할 수 없음
+                return 0.5
+            
+            # [H, W, C] -> [C, H, W]로 변환
+            image_for_clip = image_crop.transpose(2, 0, 1)
+            
+            # CLIP으로 텍스트 특징 추출 (각 후보 클래스별)
+            text_prompts = [f"a {c}" for c in candidates]
+            text_features = self.model.get_text_features(text_prompts)  # [num_candidates, 768]
+            
+            # CLIP으로 이미지 특징 추출 (dense feature map)
+            image_features = self.model.get_image_features(image_for_clip[np.newaxis, ...])  # [1, 768, H', W']
+            
+            # Dense feature를 global feature로 변환 (spatial average pooling)
+            # [1, 768, H', W'] -> [1, 768]
+            image_features_global = image_features.mean(dim=(2, 3))  # spatial average
+            image_features_global = torch.nn.functional.normalize(image_features_global, dim=1)
+            
+            # 각 텍스트 후보와의 유사도 계산 (cosine similarity)
+            # image: [1, 768], text: [num_candidates, 768] -> [1, num_candidates]
+            similarities = torch.mm(image_features_global, text_features.t())
+            similarities = similarities.squeeze(0).cpu().numpy()  # [num_candidates]
+            
+            # Softmax로 정규화 (temperature scaling으로 더 sharp한 분포)
+            temperature = 0.1
+            exp_sim = np.exp((similarities - np.max(similarities)) / temperature)
+            probs = exp_sim / exp_sim.sum()
+            
+            # 탐지된 라벨의 확률 반환
+            target_idx = candidates.index(detected_label)
+            clip_score = float(probs[target_idx])
+            
+            return clip_score
+            
+        except Exception as e:
+            # 오류 발생 시 중립적인 점수 반환
+            print(f"[CLIP Verification] Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return 0.5
+
     def find_target_object_in_graph(
         self,
         robot_x: float,
         robot_y: float,
-        min_confidence: float = 0.5,
+        min_confidence: float = 0.8,
         min_observations: int = 2,
+        min_clip_score: float = 0.23,  # CLIP 검증 최소 점수
     ) -> Optional[Tuple[np.ndarray, Any]]:
         """
         PoseGraph에서 쿼리 텍스트에 매칭되는 가장 가까운 객체 검색.
+        CLIP 검증 점수가 임계값 이상인 객체만 고려.
         경로 계획이 가능한 객체만 반환.
         
         Args:
@@ -310,6 +397,7 @@ class Navigator:
             robot_y: 로봇 y 좌표 (metric)
             min_confidence: 최소 신뢰도 임계값 (기본값 0.5, 제거 임계값 0.8보다 낮게 설정)
             min_observations: 최소 관측 횟수 (노이즈 필터링)
+            min_clip_score: 최소 CLIP 검증 점수 (0~1, 이 값 미만은 오탐지로 간주)
         
         Returns:
             (목표 픽셀 좌표 [px, py], ObjectNode) 또는 None
@@ -336,6 +424,15 @@ class Navigator:
         explored_mask = self.one_map.explored_area.astype(np.uint8)
         
         for target_obj, distance in candidates:
+            # CLIP 검증 점수 확인 (오탐지 필터링)
+            avg_clip = target_obj.avg_clip_score
+            if avg_clip > 0 and avg_clip < min_clip_score:
+                # CLIP 점수가 너무 낮음 → 오탐지 가능성 높음
+                print(f"[CLIP Filter] Rejected '{target_obj.label}' at "
+                      f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
+                      f"avg_clip={avg_clip:.3f} < {min_clip_score} (obs={target_obj.num_observations})")
+                continue
+            
             # 월드 좌표를 픽셀 좌표로 변환
             px, py = self.one_map.metric_to_px(
                 target_obj.position[0], 
@@ -354,7 +451,11 @@ class Navigator:
             )
             
             if test_path is not None and len(test_path) > 0:
-                # 경로 계획 성공 → 이 객체 반환
+                # 경로 계획 성공 → CLIP 검증 정보와 함께 로그
+                if avg_clip > 0:
+                    print(f"[CLIP Verified] Selected '{target_obj.label}' at "
+                          f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
+                          f"avg_clip={avg_clip:.3f}, obs={target_obj.num_observations}")
                 return target_px, target_obj
         
         # 모든 객체에 대해 경로 계획 실패
@@ -407,9 +508,15 @@ class Navigator:
             self.is_goal_path = False
             self.path = None
             
-            # Compute similarity for each FrontierNode (excluding blacklisted ones)
-            best_frontier_node = None
-            best_similarity = -float('inf')
+            # Compute similarity and path length for each FrontierNode (excluding blacklisted ones)
+            # 순위 기반 파레토 전략:
+            # - Semantic: CLIP similarity (높을수록 좋음)
+            # - Greedy: 경로 길이의 역수 (짧을수록 좋음)
+            all_candidates = []  # (frontier_node, sim_value, path_length, path)
+            
+            # 미리 탐색용 맵 준비 (경로 계산에 재사용)
+            explored_mask = self.one_map.explored_area.astype(np.uint8)
+            navigable_for_planning = self.one_map.navigable_map & explored_mask
             
             for frontier_node in frontier_nodes:
                 if frontier_node.coarse_embedding is None:
@@ -424,6 +531,32 @@ class Navigator:
                 if len(self.blacklisted_nav_goals) > 0 and np.any(
                         np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
                     continue
+                
+                # Compute path to frontier (A* 경로 계획)
+                candidate_path = Planning.compute_to_goal(
+                    start,
+                    navigable_for_planning,
+                    explored_mask,
+                    goal_point_px,
+                    self.obstcl_kernel_size,
+                    2
+                )
+                
+                # Skip if no path found
+                if candidate_path is None or len(candidate_path) == 0:
+                    continue
+                
+                # Compute actual path length (sum of segment lengths in pixels)
+                path_length_px = 0.0
+                for i in range(1, len(candidate_path)):
+                    segment = np.linalg.norm(
+                        np.array(candidate_path[i]) - np.array(candidate_path[i-1])
+                    )
+                    path_length_px += segment
+                
+                # Convert to metric (approximate using map resolution)
+                # path_length ≈ path_length_px * cell_size
+                path_length = path_length_px * self.one_map.cell_size
                 
                 # Convert embedding to torch tensor
                 embedding_tensor = torch.from_numpy(frontier_node.coarse_embedding).float()
@@ -445,28 +578,75 @@ class Navigator:
                 else:
                     sim_value = similarity.mean().item()
                 
-                if sim_value > best_similarity:
-                    best_similarity = sim_value
-                    best_frontier_node = frontier_node
+                all_candidates.append((frontier_node, sim_value, path_length, candidate_path))
             
-            # If we found a best frontier node, plan path to it
+            # 순위 기반 파레토 전략 (A → A → D)
+            # - Semantic: CLIP similarity (높을수록 좋음)
+            # - Greedy: 1/path_length (경로가 짧을수록 좋음)
+            # - 각각 순위 매긴 후 합산 순위가 가장 낮은 frontier 선택
+            best_frontier_node = None
+            best_similarity = -float('inf')
+            best_path_length = 0.0
+            best_path = None
+            selection_mode = "none"
+            
+            if len(all_candidates) == 0:
+                pass  # No candidates
+            elif len(all_candidates) == 1:
+                # 후보가 하나면 그것 선택
+                selection_mode = "single"
+                best_frontier_node = all_candidates[0][0]
+                best_similarity = all_candidates[0][1]
+                best_path_length = all_candidates[0][2]
+                best_path = all_candidates[0][3]
+            else:
+                # 순위 기반 파레토 선택
+                selection_mode = "pareto"
+                
+                # 점수 배열 생성
+                semantic_scores = np.array([c[1] for c in all_candidates])  # similarity
+                path_lengths = np.array([c[2] for c in all_candidates])  # 경로 길이
+                greedy_scores = 1.0 / (path_lengths + 1e-6)  # 경로 길이의 역수 (짧을수록 높음)
+                
+                # 순위 매기기 (높은 점수 = 낮은 순위, 1이 가장 좋음)
+                semantic_ranks = rankdata(-semantic_scores, method='min')
+                greedy_ranks = rankdata(-greedy_scores, method='min')
+                
+                # 합산 순위
+                combined_ranks = semantic_ranks + greedy_ranks
+                
+                # 최소 합산 순위 선택 (동점 시 semantic 우선)
+                best_idx = np.argmin(combined_ranks)
+                best_frontier_node = all_candidates[best_idx][0]
+                best_similarity = all_candidates[best_idx][1]
+                best_path_length = all_candidates[best_idx][2]
+                best_path = all_candidates[best_idx][3]
+                best_semantic_rank = int(semantic_ranks[best_idx])
+                best_greedy_rank = int(greedy_ranks[best_idx])
+                best_combined_rank = int(combined_ranks[best_idx])
+            
+            # 항상 터미널에 출력 (디버깅용)
             if best_frontier_node is not None:
-                # Convert world position to map pixel coordinates
+                if len(all_candidates) >= 2:
+                    log_msg = (f"[Frontier Selection] Mode: {selection_mode}, Candidates: {len(all_candidates)}, "
+                               f"SemanticRank: {best_semantic_rank}, GreedyRank: {best_greedy_rank}, "
+                               f"CombinedRank: {best_combined_rank}, "
+                               f"Sim: {best_similarity:.3f}, PathLen: {best_path_length:.2f}m")
+                else:
+                    log_msg = f"[Frontier Selection] Mode: {selection_mode}, Candidates: {len(all_candidates)}, PathLen: {best_path_length:.2f}m"
+                
+                print(log_msg)
+                
+                if self.log:
+                    rr.log("frontier_selection", rr.TextLog(log_msg))
+            
+            # If we found a best frontier node, use the pre-computed path
+            if best_frontier_node is not None and best_path is not None:
+                # 이미 계산한 경로 재사용 (중복 계산 방지)
+                self.path = best_path
                 goal_world = best_frontier_node.position[:2]  # [x, y]
                 goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
                 goal_point = np.array([goal_px, goal_py])
-                
-                # Plan path using Grid Map (navigable_map)
-                # Use explored_area instead of confidence_map > 0
-                explored_mask = self.one_map.explored_area.astype(np.uint8)
-                self.path = Planning.compute_to_goal(
-                    start,
-                    self.one_map.navigable_map & explored_mask,
-                    explored_mask,
-                    goal_point,
-                    self.obstcl_kernel_size,
-                    2
-                )
                 
                 if self.path:
                     if self.log:
@@ -999,11 +1179,33 @@ class Navigator:
                                 position_w = np.array([x_world_final, y_world_final, 0.0])
 
                     if position_w is not None:
+                        # CLIP 검증 점수 계산 (탐지된 라벨이 실제로 맞는지)
+                        clip_score = None
+                        try:
+                            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
+                            # Clamp to image bounds
+                            x1 = max(0, x1)
+                            y1 = max(0, y1)
+                            x2 = min(rgb_image.shape[1], x2)
+                            y2 = min(rgb_image.shape[0], y2)
+                            
+                            if x2 > x1 + 10 and y2 > y1 + 10:  # 최소 크기 확인
+                                image_crop = rgb_image[y1:y2, x1:x2]  # [H, W, C]
+                                clip_score = self.compute_clip_verification_score(image_crop, class_name)
+                                
+                                # 디버그 출력 (매 100 스텝마다)
+                                if self.pose_graph._step_counter % 100 == 0:
+                                    print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP={clip_score:.3f}")
+                        except Exception as e:
+                            if self.pose_graph._step_counter % 100 == 0:
+                                print(f"[CLIP Verify] Error for {class_name}: {e}")
+                        
                         observations.append({
                             "label": class_name,
                             "position_w": position_w,
                             "confidence": float(score),
-                            "embedding": None,  # Can add CLIP embedding later if needed
+                            "embedding": None,
+                            "clip_score": clip_score,  # CLIP 검증 점수 추가
                         })
                 
                 # Process all observations in batch
@@ -1089,77 +1291,10 @@ class Navigator:
                             colors=np.repeat(np.array([0, 255, 0])[np.newaxis, :], len(self.path), axis=0)
                         ))
         
-        # ===== YOLO 실시간 감지 (그래프에서 목표를 찾지 못한 경우 폴백) =====
-        if len(detections["boxes"]) > 0 and not self.object_detected:
-            print(f"[DEBUG] add_data: Object detection triggered for query={self.query_text}, boxes={len(detections['boxes'])}")
-            # wants rgb
-            if not sam_image_set:
-                self.sam_predictor.set_image(rgb_image)
-                sam_image_set = True
-            for area, confidence in zip(detections["boxes"], detections['scores']):
-                if self.log:
-                    rr.log("camera/detection", rr.Boxes2D(array_format=rr.Box2DFormat.XYXY, array=area))
-                    rr.log("object_detections", rr.TextLog(f"Object {self.query_text[0]} detected"))
-
-                # TODO Find free point in front of object
-                chosen_detection = (
-                    int((area[3] + area[1]) / 2), int((area[2] + area[0]) / 2))
-                masks, _, _ = self.sam_predictor.predict(point_coords=None,
-                                                         point_labels=None,
-                                                         box=np.array(area)[None, :],
-                                                         multimask_output=False, )
-                # Project the points where the mask is one
-                mask_ids = np.argwhere(masks[0] & (depth != 0))
-                depth_detection = depth[chosen_detection[0], chosen_detection[1]]
-
-                depths = depth[mask_ids[:, 0], mask_ids[:, 1]]
-
-                if not self.filter_detections_depth or depth_detection < 2.5:
-                    y_world = -(mask_ids[:, 1] - self.one_map.cx) * depths / self.one_map.fx
-                    x_world = depths
-                    r = np.array([[np.cos(yaw), -np.sin(yaw)],
-                                  [np.sin(yaw), np.cos(yaw)]])
-                    x_rot, y_rot = np.dot(r, np.stack((x_world, y_world)))
-                    x_rot += odometry[0, 3]
-                    y_rot += odometry[1, 3]
-
-                    x_id = ((x_rot / self.one_map.cell_size)).astype(np.uint32) + \
-                           self.one_map.map_center_cells[0].item()
-                    y_id = ((y_rot / self.one_map.cell_size)).astype(np.uint32) + \
-                           self.one_map.map_center_cells[1].item()
-
-                    object_valid = True
-                    if self.log:
-                        rr.log("map/proj_detect",
-                               rr.Points2D(np.stack((x_id, y_id)).T, colors=[[0, 0, 255]], radii=[1]))
-                        # log the segmentation mask as rgba
-                        rr.log("camera", rr.SegmentationImage(masks[0].astype(np.uint8))
-                               )
-                    # Consensus filtering is disabled since we don't have similarity map anymore
-                    # Simply use the closest valid detection point
-                    if object_valid:
-                        best = np.argmin(depths)
-                        if object_valid:
-                            self.chosen_detection = (x_id[best], y_id[best])
-                    if object_valid:
-                        self.object_detected = True
-                        self.compute_best_path(start)
-                        if not self.path:
-                            self.object_detected = False
-                            self.path = old_path
-                            self.path_id = old_id
-                        else:
-                            if self.log:
-                                rr.log("path_updates",
-                                       rr.TextLog(f"The object {self.query_text[0]} has been detected just now."))
-                                # 목표 위치 좌표를 [x, y]에서 [y, x]로 스왑 (chosen_detection은 (x,y) 형식)
-                                goal_swapped = [self.chosen_detection[1], self.chosen_detection[0]]
-                                rr.log("map/goal_pos",
-                                       rr.Points2D([goal_swapped], colors=[[0, 255, 0]], radii=[1]))
-        elif not self.object_detected:
+        # YOLO 폴백 주행 제거: 그래프 기반 주행만 허용
+        if not self.object_detected:
             self.chosen_detection = None
             self.object_detected = False
-        if not self.object_detected:
             if self.saw_left:
                 self.cyclic_detect_checker.add_state_action(np.array([px, py]), "L")
             elif self.saw_right:
