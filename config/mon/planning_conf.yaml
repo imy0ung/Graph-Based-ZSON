@@ -5,7 +5,7 @@ PlanningConf:
 #  yolo_confidence: 0.5 # [in yolo_world_detector.py]
   yolo_confidence: 0.8 # [in yolo_world_detector.py]
   filter_detections_depth: False # [in navigator.py]
-  consensus_filtering: True # [in navigator.py]  # For ablation. If set to false, the consensus filtering (CF) is disabled
+  #consensus_filtering: True # [in navigator.py]  # For ablation. If set to false, the consensus filtering (CF) is disabled, consensus filtering not use.
   allow_replan: True # [in navigator.py]
   use_frontiers: True # [in navigator.py]
   allow_far_plan: False # [in navigator.py]

@@ -34,7 +34,9 @@ class YOLOWorldDetector:
 
         preds = {
             "boxes": [],
-            "scores": []
+            "scores": [],
+            "class_names": [],
+            "class_ids": []
         }
 
         for detection in results.predictions:
@@ -51,6 +53,51 @@ class YOLOWorldDetector:
                 if x1 != x2 and y1 != y2:
                     preds["boxes"].append([x1, y1, x2, y2])
                     preds["scores"].append(detection.confidence)
+                    preds["class_names"].append(class_name)
+                    preds["class_ids"].append(cls)
+
+        return preds
+
+    def detect_all(self, 
+                   image: np.ndarray,
+                   confidence_threshold: float = None
+                   ) -> dict:
+        """
+        Detect all classes (not just target class).
+        For YOLOWorld, this requires classes to be set first.
+        Returns all detections with class names.
+        """
+        if confidence_threshold is None:
+            confidence_threshold = self.confidence_threshold
+            
+        if self.classes is None:
+            raise ValueError("Classes must be set before detecting")
+
+        results = self.model.infer(image, confidence=confidence_threshold)
+
+        preds = {
+            "boxes": [],
+            "scores": [],
+            "class_names": [],
+            "class_ids": []
+        }
+
+        for detection in results.predictions:
+            cls = detection.class_id
+            class_name = detection.class_name
+
+            if detection.confidence > confidence_threshold:
+                x1 = detection.x - detection.width / 2
+                y1 = detection.y - detection.height / 2
+                x2 = detection.x + detection.width / 2
+                y2 = detection.y + detection.height / 2
+
+                # Check if box is not a point
+                if x1 != x2 and y1 != y2:
+                    preds["boxes"].append([x1, y1, x2, y2])
+                    preds["scores"].append(detection.confidence)
+                    preds["class_names"].append(class_name)
+                    preds["class_ids"].append(cls)
 
         return preds
 

@@ -2,6 +2,7 @@
 This script is used to test the habitat-sim library together with OneMap
 """
 import time
+from pathlib import Path
 
 # habitat
 import habitat_sim
@@ -24,8 +25,12 @@ from scipy.spatial.transform import Rotation as R
 
 # MON
 from mapping import Navigator
+from mapping import Frontier
+from mapping import ObjectNode
+from semantic_prototypes import PrototypeConfig, SemanticPrototypeIndex
 from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
+from vision_models.yolov7_model import YOLOv7Detector
 
 # from onemap_utils import log_map_rerun
 from planning import Planning, Controllers
@@ -42,15 +47,38 @@ if __name__ == "__main__":
     else:
         raise NotImplementedError("Spot controller not suited for habitat sim")
 
+    # Initialize database - reset for each run
+    db_path = "pose_graph.db"
+    if Path(db_path).exists():
+        # print(f"Removing existing database: {db_path}")
+        Path(db_path).unlink()
+    
     model = ClipModel("weights/clip.pth")
-    detector = YOLOWorldDetector(0.3)
+    # Target object detector (for navigation)
+    #detector = YOLOWorldDetector(0.8)
+    detector = YOLOv7Detector(0.8)
     mapper = Navigator(model, detector, config)
+    proto_config = PrototypeConfig()
+    proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
+    proto_index.build_or_load(ignore_cache=True)
+    mapper.pose_graph.set_semantic_prototypes(proto_index)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
-    mapper.set_query(["A Couch"])
+
+    mapper.debug_observation_distance = True
+    mapper.pose_graph.debug_map_logging = True
+
+
+    
+    # Multi-object navigation: list of objects to find
+    #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
+    qs =["toilet", "bed", "couch"]
+    #qs =["bed"]
+    mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration()
     backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
 
     hfov = 90
@@ -93,9 +121,9 @@ if __name__ == "__main__":
     categories = [ob.category.name() for ob in objects]
     scene_categories = sim.semantic_scene.categories
     scene_categories = [cat.name() for cat in scene_categories]
-    for cat in categories:
-        if cat not in scene_categories:
-            print("Object category not in scene categories:", cat)
+    # for cat in categories:
+        # if cat not in scene_categories:
+            # print("Object category not in scene categories:", cat)
 
     for cat in scene_categories:
         if cat not in categories:
@@ -118,7 +146,6 @@ if __name__ == "__main__":
     # Main simulation loop
     initial_sequence = ["turn_left"] * 28 * 2  # + ["move_forward"]*10
     # initial_sequence = ["turn_left"]*5 + ["move_forward"]*5
-    qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
     running = True
     autonomous = True
     controller = Controllers.HabitatController(sim, config.controller)
@@ -183,7 +210,56 @@ if __name__ == "__main__":
         obj_found = mapper.add_data(
             observations["rgb"][:, :, :-1].transpose(2, 0, 1), observations["depth"].astype(np.float32),
                         transformation_matrix)
-        print("Time taken to add data: ", time.time() - t)
+
+        # print("Time taken to add data: ", time.time() - t)
+        
+        # Print nav_goals coordinates for debugging (every 10 steps)
+        if mapper.pose_graph._step_counter % 10 == 0:
+            # print(f"\n[Step {mapper.pose_graph._step_counter}] Nav Goals ({len(mapper.nav_goals)} total):")
+            # for i, nav_goal in enumerate(mapper.nav_goals): # cluster 삭제 필요 (코드 수정 필요)
+            #     coord = nav_goal.get_descr_point()
+            #     score = nav_goal.get_score()
+            #     goal_type = type(nav_goal).__name__
+            #     if goal_type == "Frontier":
+            #         print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
+            pass
+        
+        # Print graph statistics periodically
+        if mapper.pose_graph._step_counter % 10 == 0:
+            # stats = mapper.pose_graph.get_statistics()
+            # print(f"\n[Step {mapper.pose_graph._step_counter}] Graph Stats:")
+            # print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "
+            #       f"Edges: {stats['edge_count']} (pose_pose: {stats['pose_pose_edges']}, "
+            #       f"pose_object: {stats['pose_object_edges']})")
+            # 
+            if len(mapper.pose_graph.object_ids) > 0:
+                max_print = 10
+                obj_ids = mapper.pose_graph.object_ids[-max_print:]
+                print(f"\n[Step {mapper.pose_graph._step_counter}] Objects (showing {len(obj_ids)}/{len(mapper.pose_graph.object_ids)}):")
+                for obj_id in obj_ids:
+                    obj_node = mapper.pose_graph.nodes[obj_id]
+                    label = getattr(obj_node, "label_final", None) or obj_node.label
+                    conf = float(getattr(obj_node, "confidence", 0.0))
+                    conf_w = getattr(obj_node, "confidence_weighted", None)
+                    sim_in = getattr(obj_node, "sim_indoor", None)
+                    sim_out = getattr(obj_node, "sim_outdoor", None)
+                    sim_margin = getattr(obj_node, "sim_margin", None)
+                    is_outdoor = getattr(obj_node, "is_outdoor", None)
+                    conf_w_str = f"{conf_w:.3f}" if conf_w is not None else "None"
+                    sim_in_str = f"{sim_in:.3f}" if sim_in is not None else "None"
+                    sim_out_str = f"{sim_out:.3f}" if sim_out is not None else "None"
+                    sim_margin_str = f"{sim_margin:.3f}" if sim_margin is not None else "None"
+                    print(
+                        f"  - {label}: conf={conf:.3f} conf_w={conf_w_str} "
+                        f"sim_in={sim_in_str} sim_out={sim_out_str} "
+                        f"margin={sim_margin_str} outdoor={is_outdoor}"
+                    )
+        
+        # Print target object info if navigating to graph-based target
+        if mapper.target_object_node is not None:
+            # print(f"[Target] Navigating to '{mapper.target_object_node.label}' "
+            #       f"at ({mapper.target_object_node.position[0]:.2f}, {mapper.target_object_node.position[1]:.2f})")
+            pass
 
         cam_x = pos[0, 0]
         cam_y = pos[1, 0]
@@ -193,7 +269,60 @@ if __name__ == "__main__":
                     observations["depth"].max() - observations["depth"].min())))
             logger.log_map()
             logger.log_pos(cam_x, cam_y)
+            
+            # Extract and visualize Frontier coordinates in rerun (every 10 steps)
+            if mapper.pose_graph._step_counter % 10 == 0:
+                frontier_coords = []
+                for nav_goal in mapper.nav_goals:
+                    if isinstance(nav_goal, Frontier):
+                        coord = nav_goal.get_descr_point()
+                        # Convert from [y, x] to [x, y] for rerun visualization (same as path)
+                        frontier_coords.append([coord[1], coord[0]])
+                
+                if len(frontier_coords) > 0:
+                    # Create small circles for each frontier
+                    radius = 1.5  # Smaller radius
+                    num_points = 32  # Number of points to approximate circle
+                    
+                    # Generate circle points
+                    angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
+                    circle_x = np.cos(angles) * radius
+                    circle_y = np.sin(angles) * radius
+                    
+                    # Create LineStrips2D for each frontier
+                    circle_strips = []
+                    green_color = [0, 255, 0]  # Green color
+                    
+                    for center in frontier_coords:
+                        circle = np.array([
+                            [center[0] + x, center[1] + y] 
+                            for x, y in zip(circle_x, circle_y)
+                        ], dtype=np.float32)
+                        # Close the circle
+                        circle = np.vstack([circle, circle[0:1]])
+                        circle_strips.append(circle)
+                    
+                    # Log all circles
+                    rr.log("map/frontiers_only", 
+                           rr.LineStrips2D(circle_strips, 
+                                         colors=[green_color] * len(circle_strips)))
         if obj_found:
-            mapper.set_query([qs[0]])
-            qs.pop(0)
+            # print(f"Object '{mapper.query_text[0]}' found! Moving to next object...")
+            if len(qs) > 0:
+                next_obj = qs[0]
+                qs.pop(0)
+                mapper.set_query([next_obj])
+                # print(f"Now searching for: {next_obj}")
+            else:
+                # All objects found, exit
+                # print("All target objects found. Exiting...")
+                running = False
+                break
+            # Continue to next iteration to start searching for new object
             continue
+        
+        # Exit if no more queries and no path
+        if len(qs) == 0 and (mapper.get_path() is None or len(mapper.get_path()) == 0):
+            # print("No more queries and no path. Exiting...")
+            running = False
+            break

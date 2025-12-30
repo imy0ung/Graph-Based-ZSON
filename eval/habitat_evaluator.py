@@ -379,15 +379,22 @@ class HabitatEvaluator:
                         print("Object found!")
                         success_per_obj[current_obj] += 1
                     else:
+                        # chosen_detection may be None if object was reached (reset in add_data)
                         pos = self.actor.mapper.chosen_detection
-                        pos_metric = self.actor.mapper.one_map.px_to_metric(pos[0], pos[1])
-                        dist_detect = get_closest_dist([-pos_metric[1], -pos_metric[0]],
-                                            self.scene_data[episode.scene_id].object_locations[current_obj], self.is_gibson)
-                        if dist_detect < self.max_dist:
-                            results[n_ep] = Result.FAILURE_NOT_REACHED
+                        if pos is not None:
+                            pos_metric = self.actor.mapper.one_map.px_to_metric(pos[0], pos[1])
+                            dist_detect = get_closest_dist([-pos_metric[1], -pos_metric[0]],
+                                                self.scene_data[episode.scene_id].object_locations[current_obj], self.is_gibson)
+                            if dist_detect < self.max_dist:
+                                results[n_ep] = Result.FAILURE_NOT_REACHED
+                            else:
+                                results[n_ep] = Result.FAILURE_MISDETECT
+                            print(f"Object not found! Dist {dist}, detect dist: {dist_detect}.")
                         else:
+                            # If chosen_detection is None but called_found is True,
+                            # object was reached but agent is too far from ground truth
                             results[n_ep] = Result.FAILURE_MISDETECT
-                        print(f"Object not found! Dist {dist}, detect dist: {dist_detect}.")
+                            print(f"Object not found! Dist {dist}, chosen_detection was reset.")
                     current_obj_id += 1
                     # if current_obj_id < len(episode.obj_sequence):
                     #     current_obj = episode.obj_sequence[current_obj_id]
@@ -409,13 +416,16 @@ class HabitatEvaluator:
 
             num_frontiers = len(self.actor.mapper.nav_goals)
             np.savetxt(f"{self.results_path}/trajectories/poses_{episode.episode_id}.csv", poses, delimiter=",")
-            # save final sim to image file
-            final_sim = (self.actor.mapper.get_map() + 1.0) / 2.0
-            final_sim = final_sim[0]
-            final_sim = final_sim.transpose((1, 0))
-            final_sim = np.flip(final_sim, axis=0)
-            final_sim = monochannel_to_inferno_rgb(final_sim)
-            cv2.imwrite(f"{self.results_path}/similarities/final_sim_{episode.episode_id}.png", final_sim)
+            # save final exploration map to image file (similarity map no longer exists)
+            try:
+                explored_map = self.actor.mapper.get_confidence_map()  # Returns explored_area
+                final_sim = explored_map.astype(np.float32)
+                final_sim = final_sim.transpose((1, 0))
+                final_sim = np.flip(final_sim, axis=0)
+                final_sim = monochannel_to_inferno_rgb(final_sim)
+                cv2.imwrite(f"{self.results_path}/similarities/final_sim_{episode.episode_id}.png", final_sim)
+            except Exception as e:
+                print(f"Warning: Could not save similarity image: {e}")
             if (results[n_ep] == Result.FAILURE_STUCK or results[n_ep] == Result.FAILURE_OOT) and num_frontiers == 0:
                 results[n_ep] = Result.FAILURE_ALL_EXPLORED
             print(f"Overall success: {success / (n_eps)}, per object: ")

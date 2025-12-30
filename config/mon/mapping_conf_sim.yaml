@@ -4,7 +4,7 @@ MappingConf: # [all in feature_map.py]
   agent_radius: 0.2  # in meters
   blur_kernel_size: 0.05  # in meters 0.5 default
   obstacle_map_threshold: 0.4 # in occupancy value
-  fully_explored_threshold: 0.2  #
+  fully_explored_threshold: 0.0  #
   checked_map_threshold: 0.2  #
   depth_factor: 0.01  #
   gradient_factor: 0.2
