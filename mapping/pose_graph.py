@@ -979,7 +979,7 @@ class PoseGraph:
             if clip_score is not None:
                 updated_obj.clip_scores.append(clip_score)
             
-            # Remove object if confidence is too low after multiple observations
+            # Keep object even if confidence is low; let confidence keep adapting.
             min_observations_for_check = 2
             if updated_obj.confidence_weighted is not None:
                 min_confidence_threshold = 0.8 # 다중 관측
@@ -989,8 +989,8 @@ class PoseGraph:
                 conf_value = updated_obj.confidence
             if (updated_obj.num_observations >= min_observations_for_check and
                 conf_value < min_confidence_threshold):
-                self._remove_object_node(updated_obj.id)
-                return None  # Object was removed
+                # No removal: keep node and allow future observations to recover confidence.
+                pass
             
             # Update database if available
             if self.db:
@@ -1128,15 +1128,14 @@ class PoseGraph:
                 prune_threshold = 0.5
             if (updated_obj.num_observations >= min_observations_for_check and
                     prune_conf < prune_threshold):
-                self._remove_object_node(updated_obj.id)
-                results[obs_idx] = None
-            else:
-                if self.db:
-                    try:
-                        self.db.add_object_node(updated_obj, session_id=self.session_id)
-                    except Exception:
-                        pass
-                results[obs_idx] = updated_obj
+                # No removal: keep node and allow future observations to recover confidence.
+                pass
+            if self.db:
+                try:
+                    self.db.add_object_node(updated_obj, session_id=self.session_id)
+                except Exception:
+                    pass
+            results[obs_idx] = updated_obj
 
         for obs_idx in unmatched_obs_idx:
             obs = observations[obs_idx]
