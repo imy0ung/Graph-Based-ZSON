@@ -1378,23 +1378,18 @@ class PoseGraph:
             assert isinstance(obj_node, ObjectNode)
             px, py = one_map.metric_to_px(obj_node.position[0], obj_node.position[1])
             object_pixels.append([py, px])
-            object_labels.append(f"{obj_node.label} ({obj_node.confidence:.2f})")
+            object_labels.append(obj_node.label_final or obj_node.label)
         
         if object_pixels:
             object_pixels_array = np.array(object_pixels, dtype=np.float32)
             # 객체는 빨간색 별 모양으로 표시
             colors = np.tile(np.array([[255, 0, 0]], dtype=np.uint8), (object_pixels_array.shape[0], 1))
             rr.log("map/pose_graph/objects", 
-                   rr.Points2D(object_pixels_array, colors=colors, radii=[1.0] * len(object_pixels_array)))
+                   rr.Points2D(object_pixels_array, colors=colors, radii=[1.0] * len(object_pixels_array),
+                               labels=object_labels))
             # Explored map overlay
             rr.log("map/explored_objects",
                    rr.Points2D(object_pixels_array, colors=colors, radii=[1.0] * len(object_pixels_array)))
-            
-            # 객체 레이블 표시 (텍스트는 별도로 로깅)
-            for pixel, label in zip(object_pixels_array, object_labels):
-                # 텍스트 엔트리로 레이블 표시
-                rr.log("map/pose_graph/object_labels",
-                       rr.TextLog(label, color=[255, 0, 0]))
             
             # Pose-object edges 시각화
             pose_object_edges: List[Sequence[Sequence[float]]] = []

@@ -37,10 +37,18 @@ def get_db_stats(db_path: str):
             ORDER BY count DESC
         """)
         stats['object_categories'] = {row['label']: row['count'] for row in cursor.fetchall()}
+
+        cursor.execute("""
+            SELECT node_id, label, confidence, num_observations, last_seen_step
+            FROM object_nodes
+            ORDER BY confidence ASC, num_observations DESC
+        """)
+        stats['object_nodes_details'] = cursor.fetchall()
     except sqlite3.OperationalError:
         # Table doesn't exist yet (old schema)
         stats['object_nodes'] = 0
         stats['object_categories'] = {}
+        stats['object_nodes_details'] = []
     
     # Frontier nodes
     try:
@@ -133,6 +141,20 @@ def monitor_db(db_path: str = "pose_graph.db", interval: float = 1.0):
                     print(f"\n🏷️  OBJECT CATEGORIES")
                     for label, count in stats['object_categories'].items():
                         print(f"  {label:20s}: {count:>6}")
+                
+                if stats.get('object_nodes_details'):
+                    print(f"\n🧪 OBJECT NODE CONFIDENCE")
+                    for row in stats['object_nodes_details']:
+                        node_id = row['node_id']
+                        label = row['label']
+                        confidence = row['confidence']
+                        num_observations = row['num_observations']
+                        last_seen_step = row['last_seen_step']
+                        print(
+                            f"  {label:20s} {node_id:>10s} "
+                            f"conf={confidence:.3f} obs={num_observations:>4d} "
+                            f"last={last_seen_step:>6d}"
+                        )
 
                 if stats.get('region_categories'):
                     print(f"\n🏘️  REGION CATEGORIES")

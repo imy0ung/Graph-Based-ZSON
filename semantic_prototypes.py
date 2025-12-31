@@ -26,7 +26,7 @@ class PrototypeConfig:
     margin_t_high: float = 0.1
     outdoor_sim_threshold: float = 0.25
     use_dual_prototype: bool = True
-    outdoor_decay_alpha: float = 0.98
+    outdoor_decay_alpha: float = 0.3
     outdoor_margin_threshold: float = 0.0
 
 
@@ -75,6 +75,7 @@ class SemanticPrototypeIndex:
             "traffic lights and crosswalk",
             "parking lot",
             "highway",
+            "outdoor sports like skis"
         ]
         self.room_prototypes = room_prototypes or {
             "bedroom": ["bedroom", "bed and pillow", "sleeping room"],
