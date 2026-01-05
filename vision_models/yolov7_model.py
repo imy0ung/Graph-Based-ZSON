@@ -44,8 +44,8 @@ class YOLOv7Detector:
         self.class_map["bed"] = "bed"
         self.class_map["toilet"] = "toilet"
         classes_oi = ["chair", "tv", "potted plant", "bed", "toilet", "couch"]
-        self.classes_oi = [COCO_CLASSES.index(c) for c in classes_oi]
-        # self.classes_oi = None
+        # self.classes_oi = [COCO_CLASSES.index(c) for c in classes_oi]
+        self.classes_oi = None
 
     def predict(self, image):
         results = self.model(image)

@@ -16,6 +16,7 @@ from vision_models.yolov7_model import YOLOv7Detector
 
 from mapping import Navigator
 from planning import Planning, Controllers
+from semantic_prototypes import PrototypeConfig, SemanticPrototypeIndex
 # scipy
 from scipy.spatial.transform import Rotation as R
 
@@ -50,6 +51,12 @@ class MONActor(Actor):
             # self.policy = WrappedPointNavResNetPolicy("/home/finn/External/vlfm/pointnav.pth", "/home/finn/External/vlfm/pointnav_conf.pth", "cuda")
 
         self.mapper = Navigator(model, detector, config)
+        
+        # Initialize semantic prototypes for semantic decay algorithm
+        proto_config = PrototypeConfig()
+        proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
+        proto_index.build_or_load(ignore_cache=True)
+        self.mapper.pose_graph.set_semantic_prototypes(proto_index)
 
         self.init = 36*2
         hfov = 90 if self.square else 97
