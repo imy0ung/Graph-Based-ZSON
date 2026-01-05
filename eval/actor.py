@@ -109,6 +109,11 @@ class MONActor(Actor):
                 elif path == "R":
                     return_act['discrete'] = 'turn_right'
                     return return_act, False
+            # If object was found, return immediately with obj_found=True
+            if obj_found:
+                return_act['discrete'] = 'move_forward'  # Dummy action
+                return return_act, True
+            
             if path and len(path) > 0:
                 if self.policy is not None:
                     goal_pt = self.mapper.one_map.px_to_metric(path[-1][0], path[-1][1])
