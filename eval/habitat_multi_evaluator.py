@@ -173,7 +173,49 @@ class HabitatMultiEvaluator:
                        ):
         if 'discrete' in action.keys():
             # We have a discrete actor
+            # Get position before action for collision detection
+            state_before = self.sim.get_agent(0).get_state()
+            pos_before = state_before.position
+            
             self.sim.step(action['discrete'])
+            
+            # Get position after action
+            state_after = self.sim.get_agent(0).get_state()
+            pos_after = state_after.position
+            
+            # Detect collision: if position didn't change (or changed very little) during move_forward, collision occurred
+            if action['discrete'] == 'move_forward':
+                position_diff = np.linalg.norm(np.array(pos_after) - np.array(pos_before))
+                collision_threshold = 0.01  # 1cm threshold
+                if position_diff < collision_threshold:
+                    # Handle collision: move back 5 steps and blacklist target frontier
+                    if hasattr(self.actor, 'mapper') and self.actor.mapper is not None:
+                        # Convert position to mapper's coordinate system
+                        # Habitat: [x, y, z], Mapper: [-z, -x, y] based on habitat_test.py line 186
+                        current_pos_mapper = np.array([-pos_after[2], -pos_after[0]])  # [x, y] in mapper coordinates
+                        back_pos = self.actor.mapper.handle_collision(current_pos_mapper)
+                        
+                        if back_pos is not None:
+                            # Convert back_pos to pixel coordinates and create a simple path
+                            from planning import Planning
+                            back_px, back_py = self.actor.mapper.one_map.metric_to_px(back_pos[0], back_pos[1])
+                            current_px, current_py = self.actor.mapper.one_map.metric_to_px(current_pos_mapper[0], current_pos_mapper[1])
+                            
+                            # Create a simple path from current to back position
+                            explored_mask = self.actor.mapper.one_map.explored_area.astype(np.uint8)
+                            navigable_for_planning = self.actor.mapper.one_map.navigable_map & explored_mask
+                            back_path = Planning.compute_to_goal(
+                                np.array([current_px, current_py]),
+                                navigable_for_planning,
+                                explored_mask,
+                                np.array([back_px, back_py]),
+                                self.actor.mapper.obstcl_kernel_size,
+                                2
+                            )
+                            
+                            if back_path and len(back_path) > 0:
+                                self.actor.mapper.path = back_path
+                                self.actor.mapper.path_id = 0
 
         elif 'continuous' in action.keys():
             # We have a continuous actor
@@ -191,9 +233,43 @@ class HabitatMultiEvaluator:
 
             # snap rigid state to navmesh and set state to object/sim
             # calls pathfinder.try_step or self.pathfinder.try_step_no_sliding
+            target_pos = target_rigid_state.translation
             end_pos = self.sim.step_filter(
                 previous_rigid_state.translation, target_rigid_state.translation
             )
+
+            # Detect collision: if end_pos is significantly different from target_pos, collision occurred
+            position_diff = np.linalg.norm(np.array(end_pos) - np.array(target_pos))
+            collision_threshold = 0.01  # 1cm threshold
+            if position_diff > collision_threshold:
+                # Handle collision: move back 5 steps and blacklist target frontier
+                if hasattr(self.actor, 'mapper') and self.actor.mapper is not None:
+                    # Convert current position to mapper's coordinate system
+                    # Habitat: [x, y, z], Mapper: [-z, -x, y] based on habitat_test.py line 186
+                    current_pos_mapper = np.array([-end_pos[2], -end_pos[0]])  # [x, y] in mapper coordinates
+                    back_pos = self.actor.mapper.handle_collision(current_pos_mapper)
+                    
+                    if back_pos is not None:
+                        # Convert back_pos to pixel coordinates and create a simple path
+                        from planning import Planning
+                        back_px, back_py = self.actor.mapper.one_map.metric_to_px(back_pos[0], back_pos[1])
+                        current_px, current_py = self.actor.mapper.one_map.metric_to_px(current_pos_mapper[0], current_pos_mapper[1])
+                        
+                        # Create a simple path from current to back position
+                        explored_mask = self.actor.mapper.one_map.explored_area.astype(np.uint8)
+                        navigable_for_planning = self.actor.mapper.one_map.navigable_map & explored_mask
+                        back_path = Planning.compute_to_goal(
+                            np.array([current_px, current_py]),
+                            navigable_for_planning,
+                            explored_mask,
+                            np.array([back_px, back_py]),
+                            self.actor.mapper.obstcl_kernel_size,
+                            2
+                        )
+                        
+                        if back_path and len(back_path) > 0:
+                            self.actor.mapper.path = back_path
+                            self.actor.mapper.path_id = 0
 
             # set the computed state
             agent_state.position = end_pos

@@ -249,6 +249,7 @@ def setup_blueprint():
                                                 "$origin/pose_graph/edges/loop_closure",
                                                 # "$origin/ground_truth",
                                                 "$origin/frontiers_only",
+                                                "$origin/unexplored_fov",
                                                 "$origin/explored_objects",
                                                 "$origin/explored_edges/pose_object",
                                                 "$origin/pose_graph/edges/pose_frontier",
@@ -377,11 +378,24 @@ class RerunLogger:
         # Use explored_area directly for visualization
         similarities = None
 
-        explored = (self.mapper.one_map.navigable_map == 1).astype(np.float32) * 0.1
+        # Combined visualization in explored map:
+        # - Explored area (1.8m 이내): 0.5 (탐험됨)
+        # - Current far observed (1.8m~10m, 현재 프레임): 0.7 (현재 시야각 내 미탐사)
+        # - Non-navigable: 0
+        # - 나머지 (미탐사 영역): 0 (표시 안 함)
+        explored = np.zeros_like(self.mapper.one_map.navigable_map, dtype=np.float32)
+        
+        # Explored area (1.8m 이내, 탐험된 영역)
         explored[explored_area > 0] = 0.5
+        
+        # Current far observed area (1.8m~10m, 현재 프레임의 시야각 내)
+        if hasattr(self.mapper.one_map, 'current_far_observed_area'):
+            explored[self.mapper.one_map.current_far_observed_area & (self.mapper.one_map.navigable_map == 1)] = 0.7
+        
+        # Non-navigable areas remain 0
+
         # Removed fully_explored_map visualization to avoid confidence_map-style red regions
         # explored[self.mapper.one_map.fully_explored_map] = 1.0
-        explored[self.mapper.one_map.navigable_map == 0] = 0
 
         # frontiers = np.zeros((confidences.shape[0], confidences.shape[1]), dtype=np.float32)
         # for i, f in enumerate(self.mapper.frontiers):

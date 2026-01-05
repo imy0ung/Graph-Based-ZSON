@@ -165,7 +165,7 @@ class ObjectNode(BaseNode):
     
     @property
     def clip_verified(self) -> bool:
-        """CLIP 검증 통과 여부 (임계값 0.3 이상이면 신뢰)"""
+        """CLIP 검증 통과 여부 (임계값 0.05 이상이면 신뢰)"""
         return self.avg_clip_score >= 0.05
 
 

@@ -167,6 +167,8 @@ class Navigator:
 
         self.last_nav_goal = None
         self.last_frontier_node = None  # Track last frontier node for stuck detection
+        self.target_frontier_goal = None  # Target frontier goal position (persists even if frontier disappears)
+        self.target_frontier_rank = float('inf')  # Rank of target frontier (lower is better)
         self.last_pose = None
         self.saw_left = False
         self.saw_right = False
@@ -250,6 +252,8 @@ class Navigator:
         self.target_object_node = None  # Reset target object node tracking
         self.last_pose = None
         self.last_frontier_node = None  # Reset frontier node tracking
+        self.target_frontier_goal = None  # Reset target frontier goal
+        self.target_frontier_rank = float('inf')  # Reset target frontier rank
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
         self.is_goal_path = False
@@ -460,6 +464,92 @@ class Navigator:
                 return "R"
         return self.path[min(self.path_id, len(self.path)):]
 
+    def handle_collision(self, current_pos: np.ndarray) -> Optional[np.ndarray]:
+        """
+        충돌 발생 시 처리:
+        1. 5 step 뒤로 가기 (pose node 참조)
+        2. 목표 프런티어를 blacklist에 추가
+        3. 프런티어 노드 삭제
+        4. target_frontier_goal 초기화
+        
+        Args:
+            current_pos: 현재 위치 [x, y] (metric)
+        
+        Returns:
+            뒤로 갈 위치 [x, y] (metric) 또는 None (충분한 pose node가 없을 경우)
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        logger.debug("[COLLISION HANDLER] Handling collision - moving back 5 steps and blacklisting target frontier")
+        
+        # 1. 목표 프런티어를 blacklist에 추가 및 노드 삭제
+        if self.target_frontier_goal is not None:
+            goal_world = self.target_frontier_goal
+            goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+            goal_point = np.array([goal_px, goal_py])
+            
+            # Blacklist에 추가 (중복 체크)
+            is_blacklisted = False
+            if len(self.blacklisted_nav_goals) > 0:
+                is_blacklisted = np.any(np.all(goal_point == self.blacklisted_nav_goals, axis=1))
+            
+            if not is_blacklisted:
+                self.blacklisted_nav_goals.append(goal_point)
+                logger.debug(f"[COLLISION HANDLER] Added frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) to blacklist")
+            
+            # 프런티어 노드 삭제
+            frontier_key = tuple(goal_point)
+            if frontier_key in self.frontier_node_map:
+                frontier_node_id = self.frontier_node_map[frontier_key]
+                self.pose_graph._remove_frontier_node(frontier_node_id)
+                del self.frontier_node_map[frontier_key]
+                logger.debug(f"[COLLISION HANDLER] Removed frontier node {frontier_node_id} from pose graph")
+            
+            # nav_goals에서도 제거
+            for i, nav_goal in enumerate(self.nav_goals):
+                if isinstance(nav_goal, Frontier):
+                    nav_goal_point = nav_goal.get_descr_point()
+                    nav_goal_px, nav_goal_py = self.one_map.metric_to_px(nav_goal_point[0], nav_goal_point[1])
+                    nav_goal_point_px = np.array([nav_goal_px, nav_goal_py])
+                    if np.allclose(nav_goal_point_px, goal_point, atol=1.0):
+                        self.nav_goals.pop(i)
+                        logger.debug(f"[COLLISION HANDLER] Removed frontier from nav_goals")
+                        break
+            
+            # target_frontier_goal 초기화
+            self.target_frontier_goal = None
+            self.target_frontier_rank = float('inf')
+            logger.debug(f"[COLLISION HANDLER] Cleared target_frontier_goal")
+        
+        # 2. 5 step 뒤로 가기 (pose node 참조)
+        pose_ids = self.pose_graph.pose_ids
+        if len(pose_ids) < 6:  # 최소 6개 필요 (현재 + 5개 이전)
+            logger.debug(f"[COLLISION HANDLER] Not enough pose nodes ({len(pose_ids)}), cannot move back 5 steps")
+            # 경로 초기화
+            self.path = None
+            return None
+        
+        # 5 step 이전 pose node 찾기
+        target_pose_idx = len(pose_ids) - 6  # 현재가 마지막이므로 -6이 5 step 전
+        target_pose_id = pose_ids[target_pose_idx]
+        target_pose_node = self.pose_graph.nodes[target_pose_id]
+        
+        if not isinstance(target_pose_node, PoseNode):
+            logger.debug(f"[COLLISION HANDLER] Target pose node is not PoseNode type")
+            self.path = None
+            return None
+        
+        # 뒤로 갈 위치 반환
+        back_pos = np.array([target_pose_node.x, target_pose_node.y])
+        logger.debug(f"[COLLISION HANDLER] Moving back to position ({back_pos[0]:.2f}, {back_pos[1]:.2f}) from step {target_pose_node.step}")
+        
+        # 경로 초기화
+        self.path = None
+        self.path_id = 0
+        
+        return back_pos
+
     def compute_best_path(self,
                           start: np.ndarray) -> None:
         """
@@ -469,7 +559,18 @@ class Navigator:
         :return:
         """
         self.path_id = 0
+        # Check if we have a valid path to target frontier goal - if so, keep it unless we find a better frontier
+        # IMPORTANT: Check BEFORE setting self.path = None (define outside if block for proper scope)
+        existing_path_to_target = None
         if not self.object_detected:
+            if self.target_frontier_goal is not None and self.path is not None and len(self.path) > 0:
+                # Check if current path is still valid (rough check: path end is close to target)
+                path_end_px = self.path[-1]
+                goal_px, goal_py = self.one_map.metric_to_px(self.target_frontier_goal[0], self.target_frontier_goal[1])
+                goal_point_px = np.array([goal_px, goal_py])
+                if np.linalg.norm(path_end_px - goal_point_px) < 5.0:  # Within 5 pixels
+                    existing_path_to_target = self.path.copy() if hasattr(self.path, 'copy') else self.path  # Keep existing path
+            
             # We are exploring
             # First, ensure frontiers are computed
             if len(self.nav_goals) == 0:
@@ -484,8 +585,45 @@ class Navigator:
                 if isinstance(node, FrontierNode) and not node.is_explored:
                     frontier_nodes.append(node)
             
-            # If no frontier nodes, fall back to nav_goals
+            # If no frontier nodes, check if we have a target frontier goal to continue to
             if len(frontier_nodes) == 0:
+                # If we have a target frontier goal, continue to it even if frontier disappeared
+                if self.target_frontier_goal is not None:
+                    # First check if existing path is still valid
+                    if existing_path_to_target is not None:
+                        # Keep existing path to target
+                        self.path = existing_path_to_target
+                        if self.log:
+                            rr.log("path_updates", rr.TextLog(
+                                f"Keeping existing path to target frontier goal at ({self.target_frontier_goal[0]:.2f}, {self.target_frontier_goal[1]:.2f}) even though frontier disappeared."
+                            ))
+                        return
+                    
+                    # Recompute path to target goal position
+                    goal_px, goal_py = self.one_map.metric_to_px(self.target_frontier_goal[0], self.target_frontier_goal[1])
+                    goal_point = np.array([goal_px, goal_py])
+                    explored_mask = self.one_map.explored_area.astype(np.uint8)
+                    navigable_for_planning = self.one_map.navigable_map & explored_mask
+                    new_path = Planning.compute_to_goal(
+                        start,
+                        navigable_for_planning,
+                        explored_mask,
+                        goal_point,
+                        self.obstcl_kernel_size,
+                        2
+                    )
+                    if new_path and len(new_path) > 0:
+                        self.path = new_path
+                        if self.log:
+                            rr.log("path_updates", rr.TextLog(
+                                f"Recomputing path to target frontier goal at ({self.target_frontier_goal[0]:.2f}, {self.target_frontier_goal[1]:.2f}) even though frontier disappeared."
+                            ))
+                        return
+                    else:
+                        # Can't reach target, clear it
+                        self.target_frontier_goal = None
+                        self.target_frontier_rank = float('inf')
+                
                 if len(self.nav_goals) == 0:
                     return
                 # Fall back to old logic if no FrontierNodes available
@@ -494,6 +632,8 @@ class Navigator:
             
             self.initializing = False
             self.is_goal_path = False
+            
+            # existing_path_to_target is already set above
             self.path = None
             
             # Compute similarity and path length for each FrontierNode (excluding blacklisted ones)
@@ -583,10 +723,30 @@ class Navigator:
             elif len(all_candidates) == 1:
                 # 후보가 하나면 그것 선택
                 selection_mode = "single"
-                best_frontier_node = all_candidates[0][0]
-                best_similarity = all_candidates[0][1]
-                best_path_length = all_candidates[0][2]
-                best_path = all_candidates[0][3]
+                candidate = all_candidates[0]
+                best_frontier_node = candidate[0]
+                best_similarity = candidate[1]
+                best_path_length = candidate[2]
+                best_path = candidate[3]
+                best_combined_rank = 1  # Single candidate has rank 1
+                best_semantic_rank = 1
+                best_greedy_rank = 1
+                
+                # Check if we should switch to this frontier (if it has better rank than current target)
+                goal_world = best_frontier_node.position[:2]
+                if self.target_frontier_goal is not None:
+                    if best_combined_rank < self.target_frontier_rank:
+                        # Switch to better ranked frontier
+                        self.target_frontier_goal = goal_world.copy()
+                        self.target_frontier_rank = best_combined_rank
+                        if self.log:
+                            rr.log("path_updates", rr.TextLog(
+                                f"Switching to better ranked frontier (rank {best_combined_rank} < {self.target_frontier_rank}) at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                            ))
+                else:
+                    # No current target, set this as target
+                    self.target_frontier_goal = goal_world.copy()
+                    self.target_frontier_rank = best_combined_rank
             else:
                 # 순위 기반 파레토 선택
                 selection_mode = "pareto"
@@ -605,13 +765,72 @@ class Navigator:
                 
                 # 최소 합산 순위 선택 (동점 시 semantic 우선)
                 best_idx = np.argmin(combined_ranks)
-                best_frontier_node = all_candidates[best_idx][0]
-                best_similarity = all_candidates[best_idx][1]
-                best_path_length = all_candidates[best_idx][2]
-                best_path = all_candidates[best_idx][3]
-                best_semantic_rank = int(semantic_ranks[best_idx])
-                best_greedy_rank = int(greedy_ranks[best_idx])
                 best_combined_rank = int(combined_ranks[best_idx])
+                
+                # Check if we have a target frontier and if new best frontier has better rank
+                if self.target_frontier_goal is not None:
+                    # If new best frontier has better (lower) rank, switch to it
+                    if best_combined_rank < self.target_frontier_rank:
+                        # Switch to better ranked frontier
+                        best_frontier_node = all_candidates[best_idx][0]
+                        best_similarity = all_candidates[best_idx][1]
+                        best_path_length = all_candidates[best_idx][2]
+                        best_path = all_candidates[best_idx][3]
+                        best_semantic_rank = int(semantic_ranks[best_idx])
+                        best_greedy_rank = int(greedy_ranks[best_idx])
+                        # Update target frontier goal
+                        goal_world = best_frontier_node.position[:2]
+                        self.target_frontier_goal = goal_world.copy()
+                        self.target_frontier_rank = best_combined_rank
+                        if self.log:
+                            rr.log("path_updates", rr.TextLog(
+                                f"Switching to better ranked frontier (rank {best_combined_rank} < {self.target_frontier_rank}) at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                            ))
+                    else:
+                        # Keep current target, but still compute path to it
+                        # Find the target frontier in candidates
+                        target_found = False
+                        for candidate in all_candidates:
+                            candidate_world = candidate[0].position[:2]
+                            if np.allclose(candidate_world, self.target_frontier_goal, atol=0.1):
+                                # Found target, use it
+                                best_frontier_node = candidate[0]
+                                best_similarity = candidate[1]
+                                best_path_length = candidate[2]
+                                best_path = candidate[3]
+                                # Find its rank
+                                for i, c in enumerate(all_candidates):
+                                    if c[0].id == candidate[0].id:
+                                        best_semantic_rank = int(semantic_ranks[i])
+                                        best_greedy_rank = int(greedy_ranks[i])
+                                        break
+                                target_found = True
+                                break
+                        
+                        if not target_found:
+                            # Target frontier not in candidates, use best one
+                            best_frontier_node = all_candidates[best_idx][0]
+                            best_similarity = all_candidates[best_idx][1]
+                            best_path_length = all_candidates[best_idx][2]
+                            best_path = all_candidates[best_idx][3]
+                            best_semantic_rank = int(semantic_ranks[best_idx])
+                            best_greedy_rank = int(greedy_ranks[best_idx])
+                            # Update target
+                            goal_world = best_frontier_node.position[:2]
+                            self.target_frontier_goal = goal_world.copy()
+                            self.target_frontier_rank = best_combined_rank
+                else:
+                    # No current target, use best frontier
+                    best_frontier_node = all_candidates[best_idx][0]
+                    best_similarity = all_candidates[best_idx][1]
+                    best_path_length = all_candidates[best_idx][2]
+                    best_path = all_candidates[best_idx][3]
+                    best_semantic_rank = int(semantic_ranks[best_idx])
+                    best_greedy_rank = int(greedy_ranks[best_idx])
+                    # Set as target
+                    goal_world = best_frontier_node.position[:2]
+                    self.target_frontier_goal = goal_world.copy()
+                    self.target_frontier_rank = best_combined_rank
             
             # 항상 터미널에 출력 (디버깅용)
             if best_frontier_node is not None:
@@ -623,6 +842,10 @@ class Navigator:
                 else:
                     log_msg = f"[Frontier Selection] Mode: {selection_mode}, Candidates: {len(all_candidates)}, PathLen: {best_path_length:.2f}m"
                 
+                # Add target frontier info if available
+                if self.target_frontier_goal is not None:
+                    log_msg += f", TargetGoal: ({self.target_frontier_goal[0]:.2f}, {self.target_frontier_goal[1]:.2f}), TargetRank: {self.target_frontier_rank}"
+                
                 print(log_msg)
                 
                 if self.log:
@@ -630,9 +853,33 @@ class Navigator:
             
             # If we found a best frontier node, use the pre-computed path
             if best_frontier_node is not None and best_path is not None:
-                # 이미 계산한 경로 재사용 (중복 계산 방지)
-                self.path = best_path
                 goal_world = best_frontier_node.position[:2]  # [x, y]
+                
+                # Check if this is the same as our target frontier goal
+                is_target_frontier = (self.target_frontier_goal is not None and 
+                                     np.allclose(goal_world, self.target_frontier_goal, atol=0.1))
+                
+                # If we have an existing path to target and this is the target, keep existing path
+                if is_target_frontier and existing_path_to_target is not None:
+                    self.path = existing_path_to_target
+                    if self.log:
+                        rr.log("path_updates", rr.TextLog(
+                            f"Keeping existing path to target frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                        ))
+                else:
+                    # Use new computed path
+                    self.path = best_path
+                
+                # Update target frontier goal if this is a new selection (not already set or different from current)
+                if self.target_frontier_goal is None or not np.allclose(goal_world, self.target_frontier_goal, atol=0.1):
+                    self.target_frontier_goal = goal_world.copy()
+                    # Find rank for this frontier
+                    if len(all_candidates) > 1:
+                        # best_combined_rank should already be set from above
+                        self.target_frontier_rank = best_combined_rank
+                    else:
+                        self.target_frontier_rank = 1
+                
                 goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
                 goal_point = np.array([goal_px, goal_py])
                 
@@ -1326,6 +1573,8 @@ class Navigator:
                 return True
             # Consensus filtering is disabled since we don't have similarity map anymore
         if self.allow_replan:
+            # Always call compute_best_path to check for better frontiers
+            # It will maintain path to target frontier if valid
             self.compute_best_path(start)
         if self.object_detected and self.path is not None and len(self.path) < 3:
             # Path too short (likely reached object): reset detection state and signal success
@@ -1496,14 +1745,14 @@ class Navigator:
         depth_consistency: bool = True,
     ) -> Optional[np.ndarray]:
         """
-        Build a robust embedding for a frontier by aggregating features from multiple projected samples.
+        Build a robust embedding for a frontier using depth-based visibility validation and region-based feature extraction.
 
-        Sampling strategy:
-        - Sample up to `max_samples` points evenly along the frontier contour (map pixels).
-        - Project each point into the current camera view.
-        - Optionally filter samples with a depth-consistency check.
-        - Extract a pooled patch feature per valid sample.
-        - Average and L2-normalize.
+        Algorithm:
+        1. Convert frontier points from world to camera pixel coordinates (u,v) with projected depth z_proj
+        2. Validate visibility: exclude points where (z_proj - z_meas) > 0.3m (occluded by obstacles)
+        3. Create binary mask (H,W) for valid pixels and apply dilation using max_pool2d
+        4. Extract features using grid_sample with bilinear interpolation on dilated mask
+        5. Select top-K features by L2 norm and average them for final embedding
         """
         if self.current_image_features is None or self.current_depth is None or self.current_odometry is None:
             return None
@@ -1512,23 +1761,23 @@ class Navigator:
         if points_px.shape[0] < 2:
             return None
 
-        num = int(min(max_samples, points_px.shape[0]))
-        sample_indices = np.linspace(0, points_px.shape[0] - 1, num=num, dtype=np.int32)
-        sample_indices = np.unique(
-            np.concatenate(
-                [sample_indices, np.array([points_px.shape[0] // 2], dtype=np.int32)]
-            )
-        )
-
-        features: List[np.ndarray] = []
-        for idx in sample_indices:
-            px_f, py_f = points_px[int(idx)]
+        # Get image and depth dimensions
+        depth_h, depth_w = self.current_depth.shape[0], self.current_depth.shape[1]
+        feat_h, feat_w = self.current_image_features.shape[1], self.current_image_features.shape[2]
+        
+        # Step 1 & 2: Convert frontier points to camera pixel coordinates and validate visibility
+        valid_pixel_coords = []  # List of (u, v) tuples for valid pixels
+        
+        for idx in range(points_px.shape[0]):
+            px_f, py_f = points_px[idx]
             px = int(np.round(px_f))
             py = int(np.round(py_f))
-
+            
+            # Convert map pixel to world coordinates
             x_world, y_world = self.one_map.px_to_metric(px, py)
             position_w = np.array([x_world, y_world, 0.0], dtype=np.float32)
-
+            
+            # Convert to camera pixel coordinates with projected depth
             proj = self._world_to_camera_pixel_with_depth(
                 position_w,
                 self.current_depth,
@@ -1537,34 +1786,106 @@ class Navigator:
             )
             if proj is None:
                 continue
-            pixel_x, pixel_y, expected_depth = proj
-
-            if depth_consistency:
-                depth_px = self.current_depth[pixel_y, pixel_x]
-                measured = float(depth_px) if np.ndim(depth_px) == 0 else float(depth_px[0])
-                if not np.isfinite(measured) or measured <= 0:
-                    continue
-                tol = max(0.5, 0.25 * float(expected_depth))
-                if abs(measured - float(expected_depth)) > tol:
-                    continue
-
-            feat = self._extract_image_feature_patch(
-                self.current_image_features,
-                pixel_x,
-                pixel_y,
-                patch_radius=patch_radius,
-            )
-            if feat is not None:
-                features.append(feat)
-
-        if len(features) == 0:
+            u, v, z_proj = proj  # u is pixel_x, v is pixel_y, z_proj is projected depth
+            
+            # Validate visibility: check if point is occluded
+            # Note: depth is accessed as depth[v, u] (row, col)
+            if 0 <= u < depth_w and 0 <= v < depth_h:
+                z_meas = float(self.current_depth[v, u])
+                if np.isfinite(z_meas) and z_meas > 0:
+                    # If (z_proj - z_meas) > 0.3, point is occluded (threshold = 0.3m)
+                    if (z_proj - z_meas) <= 0.3:
+                        valid_pixel_coords.append((u, v))
+        
+        if len(valid_pixel_coords) == 0:
             return None
-
-        emb = np.mean(np.stack(features, axis=0), axis=0)
-        norm = float(np.linalg.norm(emb))
+        
+        # Step 3: Create binary mask (H, W) for valid pixels
+        binary_mask = torch.zeros((depth_h, depth_w), dtype=torch.float32, device=self.current_image_features.device)
+        for u, v in valid_pixel_coords:
+            binary_mask[v, u] = 1.0  # v is row, u is col
+        
+        # Apply dilation using max_pool2d (kernel size 5x5 or 7x7)
+        # Add batch and channel dimensions: [1, 1, H, W]
+        mask_batch = binary_mask.unsqueeze(0).unsqueeze(0)
+        kernel_size = 5  # Can be changed to 7 if needed
+        # Use padding to preserve size: padding = kernel_size // 2
+        dilated_mask = torch.nn.functional.max_pool2d(
+            mask_batch,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=kernel_size // 2
+        ).squeeze(0).squeeze(0)  # Back to [H, W]
+        
+        # Get valid pixel coordinates from dilated mask (non-zero pixels)
+        valid_indices = torch.nonzero(dilated_mask > 0.5, as_tuple=False)  # [N, 2] where each row is [v, u]
+        if valid_indices.shape[0] == 0:
+            return None
+        
+        # Step 4: Convert pixel coordinates to feature map coordinates and normalize to [-1, 1]
+        # First, convert depth image pixel coordinates to feature map coordinates
+        u_coords_depth = valid_indices[:, 1].float()  # Column indices (u) in depth image
+        v_coords_depth = valid_indices[:, 0].float()  # Row indices (v) in depth image
+        
+        # Convert to feature map coordinates using the same scaling as _pixel_to_feature_coords
+        u_coords_feat = u_coords_depth * feat_w / depth_w if depth_w > 0 else u_coords_depth * 0.0
+        v_coords_feat = v_coords_depth * feat_h / depth_h if depth_h > 0 else v_coords_depth * 0.0
+        
+        # Normalize feature map coordinates to [-1, 1] for grid_sample
+        # With align_corners=False, pixel centers are aligned: coord_norm = (coord + 0.5) / size * 2 - 1
+        u_norm = ((u_coords_feat + 0.5) / feat_w) * 2.0 - 1.0 if feat_w > 0 else u_coords_feat * 0.0
+        v_norm = ((v_coords_feat + 0.5) / feat_h) * 2.0 - 1.0 if feat_h > 0 else v_coords_feat * 0.0
+        
+        # Create grid for grid_sample: shape [1, 1, N, 2] where each entry is [u_norm, v_norm]
+        # grid_sample expects grid shape [N, H_out, W_out, 2]
+        # For sampling N points, we use [1, 1, N, 2] so output is [1, F, 1, N]
+        grid = torch.stack([u_norm, v_norm], dim=1).unsqueeze(0).unsqueeze(0)  # [1, 1, N, 2]
+        grid = grid.to(self.current_image_features.device)
+        
+        # Prepare image features for grid_sample: [1, F, Hf, Wf]
+        image_features_batch = self.current_image_features.unsqueeze(0)  # [1, F, Hf, Wf]
+        
+        # Use grid_sample with bilinear interpolation
+        # Note: grid_sample expects grid in (x, y) format which maps to (width, height) = (u, v)
+        sampled_features = torch.nn.functional.grid_sample(
+            image_features_batch,
+            grid,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=False
+        )  # Output: [1, F, 1, N]
+        
+        # Reshape to [N, F] where N is number of valid pixels, F is feature dimension
+        # [1, F, 1, N] -> [F, N] -> [N, F]
+        sampled_features = sampled_features.squeeze(0).squeeze(1)  # [1, F, 1, N] -> [F, N]
+        sampled_features = sampled_features.t()  # [F, N] -> [N, F]
+        
+        # Step 5: Top-K selection by L2 norm and average (select top 10%)
+        # Compute L2 norms for each feature vector
+        l2_norms = torch.norm(sampled_features, dim=1)  # [N]
+        
+        # Select top 10% of features by L2 norm (minimum 1, maximum all)
+        num_features = sampled_features.shape[0]
+        if num_features == 0:
+            return None
+        
+        k = max(1, int(num_features * 0.1))  # Top 10%, at least 1
+        k = min(k, num_features)  # Don't exceed total number of features
+        
+        # Get indices of top-K features by L2 norm
+        _, top_k_indices = torch.topk(l2_norms, k=k)
+        top_k_features = sampled_features[top_k_indices]  # [K, F]
+        
+        # Average the top-K features
+        final_embedding = top_k_features.mean(dim=0)  # [F]
+        
+        # L2 normalize
+        norm = torch.norm(final_embedding)
         if norm > 1e-8:
-            emb = emb / norm
-        return emb
+            final_embedding = final_embedding / norm
+        
+        # Convert to numpy array
+        return final_embedding.cpu().numpy()
     
     def _extract_image_feature_at_pixel(
         self,

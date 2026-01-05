@@ -214,6 +214,9 @@ def detect_frontiers(
     )
     unexplored_mask = np.where(filtered_explored_mask > 0, 0, full_map)
     # Note: known_th filtering is not used in VLFM style
+    # Apply unexplored_fov_area mask if available (depth-based frontier strategy)
+    # Unexplored areas are those not explored AND not observed in FOV (1.8m~10m range)
+    # For now, we use the standard definition, but this can be extended to use unexplored_fov_area
     unexplored_mask = cv2.blur(  # blurring for some leeway
         np.where(unexplored_mask > 0, 255, unexplored_mask), (5, 5)
     )

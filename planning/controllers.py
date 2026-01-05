@@ -8,8 +8,21 @@ import numpy as np
 import habitat_sim
 from habitat_sim.utils import common as utils
 
+# logging
+import logging
+
 # conf
 from config import HabitatControllerConf, SpotControllerConf
+
+# Set up debug logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 class Controller(ABC):
@@ -69,11 +82,12 @@ class HabitatController(Controller):
 
         return angular_velocity, linear_velocity
 
-    def control(self, pos, yaw, path, own_update=True):
+    def control(self, pos, yaw, path, own_update=True, mapper=None):
         """
         Executes the habitat control logic for the agent
         :param pos: np.ndarray of shape [2, ], pos in metric units
         :param path: path in metric units
+        :param mapper: Optional Navigator instance for collision handling
         :return:
         """
         pos = pos.astype(np.float32)
@@ -123,9 +137,51 @@ class HabitatController(Controller):
 
         # snap rigid state to navmesh and set state to object/sim
         # calls pathfinder.try_step or self.pathfinder.try_step_no_sliding
+        target_pos = target_rigid_state.translation
         end_pos = self.sim.step_filter(
             previous_rigid_state.translation, target_rigid_state.translation
         )
+
+        # Detect collision: if end_pos is significantly different from target_pos, collision occurred
+        position_diff = np.linalg.norm(np.array(end_pos) - np.array(target_pos))
+        collision_threshold = 0.01  # 1cm threshold
+        if position_diff > collision_threshold:
+            logger.debug(f"[COLLISION DETECTED] Target position: {target_pos}, Actual position: {end_pos}, "
+                        f"Difference: {position_diff:.4f}m")
+            logger.debug(f"[COLLISION DETECTED] Previous position: {previous_rigid_state.translation}, "
+                        f"Linear velocity: {self.vel_control.linear_velocity}, "
+                        f"Angular velocity: {self.vel_control.angular_velocity}")
+            
+            # Handle collision: move back 5 steps and blacklist target frontier
+            if mapper is not None:
+                # Convert current position to mapper's coordinate system
+                # Habitat: [x, y, z], Mapper: [-z, -x, y] based on habitat_test.py line 186
+                current_pos_mapper = np.array([-end_pos[2], -end_pos[0]])  # [x, y] in mapper coordinates
+                back_pos = mapper.handle_collision(current_pos_mapper)
+                
+                if back_pos is not None:
+                    logger.debug(f"[COLLISION HANDLER] Setting path to move back to ({back_pos[0]:.2f}, {back_pos[1]:.2f})")
+                    # Convert back_pos to pixel coordinates and create a simple path
+                    back_px, back_py = mapper.one_map.metric_to_px(back_pos[0], back_pos[1])
+                    current_px, current_py = mapper.one_map.metric_to_px(current_pos_mapper[0], current_pos_mapper[1])
+                    
+                    # Create a simple path from current to back position
+                    from planning import Planning
+                    explored_mask = mapper.one_map.explored_area.astype(np.uint8)
+                    navigable_for_planning = mapper.one_map.navigable_map & explored_mask
+                    back_path = Planning.compute_to_goal(
+                        np.array([current_px, current_py]),
+                        navigable_for_planning,
+                        explored_mask,
+                        np.array([back_px, back_py]),
+                        mapper.obstcl_kernel_size,
+                        2
+                    )
+                    
+                    if back_path and len(back_path) > 0:
+                        mapper.path = back_path
+                        mapper.path_id = 0
+                        logger.debug(f"[COLLISION HANDLER] Created back path with {len(back_path)} waypoints")
 
         # set the computed state
         agent_state.position = end_pos

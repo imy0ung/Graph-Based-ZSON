@@ -3,6 +3,7 @@ This script is used to test the habitat-sim library together with OneMap
 """
 import time
 from pathlib import Path
+import logging
 
 # habitat
 import habitat_sim
@@ -10,6 +11,16 @@ from habitat_sim.utils import common as utils
 
 # numpy
 import numpy as np
+
+# Set up debug logger
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    handler.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 # rerun
 import rerun as rr
@@ -69,8 +80,10 @@ if __name__ == "__main__":
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration()
-    backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00820-mL8ThkuaVTM/mL8ThkuaVTM.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
+    backend_cfg.scene_id = hm3d_path + "/val/00876-mv2HUxq3B53/mv2HUxq3B53.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
 
     hfov = 90
@@ -173,10 +186,55 @@ if __name__ == "__main__":
                 path = path.astype(np.float32)
                 for i in range(path.shape[0]):
                     path[i, :] = mapper.one_map.px_to_metric(path[i, 0], path[i, 1])
-                controller.control(current_pos, yaw, path)
+                controller.control(current_pos, yaw, path, mapper=mapper)
                 observations = sim.get_sensor_observations()
         if action and action != "enter_query":
+            # Get position before action
+            state_before = sim.get_agent(0).get_state()
+            pos_before = state_before.position
+            
             observations = sim.step(action)
+            
+            # Get position after action
+            state_after = sim.get_agent(0).get_state()
+            pos_after = state_after.position
+            
+            # Detect collision: if position didn't change (or changed very little) during move_forward, collision occurred
+            if action == "move_forward":
+                position_diff = np.linalg.norm(np.array(pos_after) - np.array(pos_before))
+                collision_threshold = 0.01  # 1cm threshold
+                if position_diff < collision_threshold:
+                    logger.debug(f"[COLLISION DETECTED] Action: {action}, Position before: {pos_before}, "
+                                f"Position after: {pos_after}, Movement: {position_diff:.4f}m")
+                    
+                    # Handle collision: move back 5 steps and blacklist target frontier
+                    # Convert position to mapper's coordinate system
+                    # Habitat: [x, y, z], Mapper: [-z, -x, y] based on habitat_test.py line 186
+                    current_pos_mapper = np.array([-pos_after[2], -pos_after[0]])  # [x, y] in mapper coordinates
+                    back_pos = mapper.handle_collision(current_pos_mapper)
+                    
+                    if back_pos is not None:
+                        logger.debug(f"[COLLISION HANDLER] Setting path to move back to ({back_pos[0]:.2f}, {back_pos[1]:.2f})")
+                        # Convert back_pos to pixel coordinates and create a simple path
+                        back_px, back_py = mapper.one_map.metric_to_px(back_pos[0], back_pos[1])
+                        current_px, current_py = mapper.one_map.metric_to_px(current_pos_mapper[0], current_pos_mapper[1])
+                        
+                        # Create a simple path from current to back position
+                        explored_mask = mapper.one_map.explored_area.astype(np.uint8)
+                        navigable_for_planning = mapper.one_map.navigable_map & explored_mask
+                        back_path = Planning.compute_to_goal(
+                            np.array([current_px, current_py]),
+                            navigable_for_planning,
+                            explored_mask,
+                            np.array([back_px, back_py]),
+                            mapper.obstcl_kernel_size,
+                            2
+                        )
+                        
+                        if back_path and len(back_path) > 0:
+                            mapper.path = back_path
+                            mapper.path_id = 0
+                            logger.debug(f"[COLLISION HANDLER] Created back path with {len(back_path)} waypoints")
         elif not autonomous:
             continue
 

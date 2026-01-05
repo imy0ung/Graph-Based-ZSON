@@ -122,9 +122,17 @@ class OneMap:
         self.fully_explored_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
         self.explored_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
         self.checked_map = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        # Depth-based frontier strategy: track unexplored area in FOV (1.8m~10m range)
+        self.unexplored_fov_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
+        # Current frame's far observed area (1.8m~10m) for visualization
+        self.current_far_observed_area = np.zeros((self.n_cells, self.n_cells), dtype=bool)
 
         self.checked_conf_map = torch.zeros((self.n_cells, self.n_cells), dtype=torch.float32)
         self.checked_conf_map = self.checked_conf_map.to(self.map_device)
+        
+        # D435 depth camera thresholds for frontier detection
+        self.depth_explored_threshold = 4.5  # meters - explored range
+        self.depth_unexplored_max = 10.0  # meters - unexplored range max
 
         self.fx = None
         self.fy = None
@@ -228,18 +236,19 @@ class OneMap:
         elif len(values.shape) == 3:
             values = values.permute(1, 2, 0)  # feature_dim last for convenience
             (observed_cell_indices,
-             obstacle_mapped, obstcl_confidence_mapped) = self.project_dense(values, torch.Tensor(depth).to("cuda"),
+             obstacle_mapped, obstcl_confidence_mapped, far_cell_indices) = self.project_dense(values, torch.Tensor(depth).to("cuda"),
                                                                              torch.tensor(tf_camera_to_episodic),
                                                                              self.fx, self.fy,
                                                                              self.cx, self.cy)
         else:
             raise Exception("Provided Value observation of unsupported format")
-        self.fuse_maps(observed_cell_indices, obstacle_mapped, obstcl_confidence_mapped, artifical_obstacles)
+        self.fuse_maps(observed_cell_indices, obstacle_mapped, obstcl_confidence_mapped, far_cell_indices, artifical_obstacles)
 
     def fuse_maps(self,
                   observed_cell_indices: torch.Tensor,
                   obstacle_mapped: torch.Tensor,
                   obstcl_confidence_mapped: torch.Tensor,
+                  far_cell_indices: torch.Tensor,
                   artifical_obstacles: Optional[List[Tuple[float]]] = None
                   ) -> None:
         """
@@ -315,6 +324,22 @@ class OneMap:
 
             # Only mark navigable areas as explored
             self.explored_area = self.explored_area & self.navigable_map
+            
+            # Update unexplored_fov_area: mark 1.8m~10m range cells as observed in FOV
+            # These cells are removed from unexplored when they enter the robot's FOV
+            # Also track current frame's far observed area for visualization
+            self.current_far_observed_area.fill(False)  # Reset current frame
+            if far_cell_indices.shape[1] > 0:
+                far_indices_np = far_cell_indices.cpu().numpy()
+                valid_mask_far = (far_indices_np[0] >= 0) & (far_indices_np[0] < self.n_cells) & \
+                                (far_indices_np[1] >= 0) & (far_indices_np[1] < self.n_cells)
+                if valid_mask_far.any():
+                    valid_far_indices = far_indices_np[:, valid_mask_far].astype(np.int32)
+                    # Mark as observed in FOV (these areas are no longer unexplored)
+                    # Remove from unexplored_fov_area when they enter FOV
+                    self.unexplored_fov_area[valid_far_indices[0], valid_far_indices[1]] = False
+                    # Store current frame's far observed area for visualization
+                    self.current_far_observed_area[valid_far_indices[0], valid_far_indices[1]] = True
 
             # Update fully_explored_map based on checked_map threshold
             # 신뢰도 기반 판정: 1 / conf < threshold 형태로 복원
@@ -418,22 +443,30 @@ class OneMap:
         pcl_grid_ids[:, 1] += self.map_center_cells[1]
 
         # Filter valid updates
-        mask = (depth_aligned.flatten() != float('inf')) & (depth_aligned.flatten() != 0) & (pcl_grid_ids[:, 0] >= self.kernel_half + 1) & (
+        depth_flat = depth_aligned.flatten()
+        mask = (depth_flat != float('inf')) & (depth_flat != 0) & (pcl_grid_ids[:, 0] >= self.kernel_half + 1) & (
                 pcl_grid_ids[:, 0] < self.n_cells - self.kernel_half - 1) & (
                        pcl_grid_ids[:, 1] >= self.kernel_half + 1) & (
                        pcl_grid_ids[:, 1] < self.n_cells - self.kernel_half - 1)  # for value map
+        
+        # Depth-based frontier strategy: separate explored (<=1.8m) and far observed (1.8m~10m) areas
+        mask_explored = mask & (depth_flat <= self.depth_explored_threshold)  # 1.8m 이내: 탐색된 영역
+        mask_far_observed = mask & (depth_flat > self.depth_explored_threshold) & (depth_flat <= self.depth_unexplored_max)  # 1.8m~10m: 미탐색 영역 (시야각 내)
+        
         if hole_mask.nelement() == 0:
-            mask_obstacle = mask & (((rotated_pcl[:, 2]> self.obstacle_min) & (
+            mask_obstacle = mask_explored & (((rotated_pcl[:, 2]> self.obstacle_min) & (
                                          rotated_pcl[:, 2]  < self.obstacle_max)) )
         else:
-            mask_obstacle = mask & (((rotated_pcl[:, 2] > self.obstacle_min) & (
+            mask_obstacle = mask_explored & (((rotated_pcl[:, 2] > self.obstacle_min) & (
                     rotated_pcl[:, 2] < self.obstacle_max)) | hole_mask)
-        mask &= (scores_aligned > 1e-5)
-        mask_obstacle_masked = mask_obstacle[mask]
-        scores_masked = scores_aligned[mask]
+        mask_explored &= (scores_aligned > 1e-5)
+        mask_obstacle_masked = mask_obstacle[mask_explored]
+        scores_masked = scores_aligned[mask_explored]
 
-        pcl_grid_ids_masked = pcl_grid_ids[mask].T
-        values_to_add = values_aligned[mask] * scores_masked.unsqueeze(1)
+        pcl_grid_ids_masked = pcl_grid_ids[mask_explored].T
+        # Store far observed cell indices for unexplored_fov_area update
+        pcl_grid_ids_far = pcl_grid_ids[mask_far_observed].T if mask_far_observed.any() else torch.empty((2, 0), dtype=torch.int32, device='cuda')
+        values_to_add = values_aligned[mask_explored] * scores_masked.unsqueeze(1)
 
         combined_data = torch.cat((
             values_to_add,
@@ -474,10 +507,16 @@ class OneMap:
         obstacle_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, obstacle_mapped.unsqueeze(1), (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
         obstcl_confidence_mapped = torch.sparse_coo_tensor(pcl_grid_ids_masked_unique, coalesced_scores, (self.n_cells, self.n_cells, 1), is_coalesced=True).cpu()
         
-        # Return observed cell indices (all_ids) for explored_area update
+        # Return observed cell indices for explored_area update (only <= 1.8m)
         observed_cell_indices = all_ids.cpu()
         
-        return observed_cell_indices, obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu()
+        # Return far observed cell indices (1.8m~10m) for unexplored_fov_area update
+        if pcl_grid_ids_far.shape[1] > 0:
+            far_cell_indices = pcl_grid_ids_far.unique(dim=1).cpu()
+        else:
+            far_cell_indices = torch.empty((2, 0), dtype=torch.int32)
+        
+        return observed_cell_indices, obstacle_mapped.cpu(), obstcl_confidence_mapped.cpu(), far_cell_indices
 
     def project_single(self,
                        values: torch.Tensor,
