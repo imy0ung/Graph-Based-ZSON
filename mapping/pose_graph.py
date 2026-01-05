@@ -393,10 +393,17 @@ class PoseGraph:
 
     def _apply_semantic_decay(self, obj: ObjectNode) -> None:
         if self.proto_index is None:
+            if self._step_counter % 100 == 0:  # Debug: check if proto_index is None
+                print(f"[Semantic Decay] WARNING: proto_index is None at step {self._step_counter}")
             return
         label_used = obj.label_final or obj.label
         decision = self.proto_index.outdoor_decision(label_used)
         is_outdoor = decision.get("is_outdoor")
+        sim_indoor = decision.get("sim_indoor")
+        sim_outdoor = decision.get("sim_outdoor")
+        sim_margin = decision.get("sim_margin")
+        
+        old_confidence = obj.confidence
         obj.is_outdoor = is_outdoor
         if is_outdoor:
             obj.confidence *= float(self.proto_index.config.outdoor_decay_alpha)
@@ -404,9 +411,20 @@ class PoseGraph:
             obj.confidence_weighted = obj.confidence
         else:
             obj.confidence_weighted = obj.confidence
-        obj.sim_indoor = decision.get("sim_indoor")
-        obj.sim_outdoor = decision.get("sim_outdoor")
-        obj.sim_margin = decision.get("sim_margin")
+        obj.sim_indoor = sim_indoor
+        obj.sim_outdoor = sim_outdoor
+        obj.sim_margin = sim_margin
+        
+        # Debug output: print semantic decay information
+        # Always print for outdoor objects, or every 10 steps for indoor objects (more frequent)
+        if is_outdoor or self._step_counter % 10 == 0:
+            status = "OUTDOOR" if is_outdoor else "INDOOR"
+            decay_info = ""
+            if is_outdoor:
+                decay_info = f" (confidence: {old_confidence:.3f} -> {obj.confidence:.3f}, decay_alpha={self.proto_index.config.outdoor_decay_alpha})"
+            print(f"[Semantic Decay] Step {self._step_counter}: '{label_used}' -> {status} | "
+                  f"sim_indoor={sim_indoor:.3f}, sim_outdoor={sim_outdoor:.3f}, margin={sim_margin:.3f}"
+                  f"{decay_info} | obs={obj.num_observations}, pos=({obj.position[0]:.2f}, {obj.position[1]:.2f})", flush=True)
 
     def _update_label_belief(
         self,
@@ -1117,6 +1135,8 @@ class PoseGraph:
                 q_view=1.0,
             )
             self._apply_label_hysteresis(updated_obj, best_label)
+            if self._step_counter % 20 == 0:  # Debug: confirm method is being called
+                print(f"[Semantic Decay] Calling _apply_semantic_decay for '{updated_obj.label}' at step {self._step_counter}", flush=True)
             self._apply_semantic_decay(updated_obj)
 
             min_observations_for_check = 2
@@ -1174,6 +1194,8 @@ class PoseGraph:
             )
             self._add_edge(edge)
 
+            if self._step_counter % 20 == 0:  # Debug: confirm method is being called
+                print(f"[Semantic Decay] Calling _apply_semantic_decay for new object '{obj_node.label}' at step {self._step_counter}", flush=True)
             self._apply_semantic_decay(obj_node)
             if self.db:
                 try:
