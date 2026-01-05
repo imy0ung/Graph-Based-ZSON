@@ -9,3 +9,6 @@ results*/
 yolov7
 weights
 datasets
+
+# Database files
+pose_graph.db
