@@ -571,24 +571,24 @@ class HabitatMultiEvaluator:
                             if (result == Result.FAILURE_STUCK or result == Result.FAILURE_OOT) and num_frontiers == 0:
                                 result = Result.FAILURE_ALL_EXPLORED
                         results[-1].add_sequence(np.array(poses), result, current_obj)
-                        final_sim = (self.actor.mapper.get_map() + 1.0) / 2.0
-                        confs = (self.actor.mapper.one_map.confidence_map > 0).cpu().squeeze().numpy()
-                        nav_map = self.actor.mapper.one_map.navigable_map.astype(bool)
-                        final_sim = final_sim[0]
-                        final_sim = monochannel_to_inferno_rgb(final_sim)
-
-                        final_sim[~confs, :] = [0, 0, 0]
-                        # final_sim[(~nav_map) & confs, :] = [0, 0, 0]
-                        min_x = np.min(np.where(confs)[0])
-                        max_x = np.max(np.where(confs)[0])
-                        min_y = np.min(np.where(confs)[1])
-                        max_y = np.max(np.where(confs)[1])
-                        final_sim = final_sim[min_x:max_x, min_y:max_y]
-                        final_sim = final_sim.transpose((1, 0, 2))
-                        final_sim = np.flip(final_sim, axis=0)                        # get min and max x and y of confs
-
-
-                        cv2.imwrite(f"{self.results_path}/similarities/final_sim_{episode.episode_id}_{sequence_id}.png", final_sim)
+                        # save final exploration map to image file (similarity map no longer exists)
+                        try:
+                            explored_map = self.actor.mapper.get_confidence_map()  # Returns explored_area
+                            final_sim = explored_map.astype(np.float32)
+                            confs = self.actor.mapper.one_map.explored_area.astype(bool)
+                            final_sim = monochannel_to_inferno_rgb(final_sim)
+                            final_sim[~confs, :] = [0, 0, 0]
+                            if np.any(confs):
+                                min_x = np.min(np.where(confs)[0])
+                                max_x = np.max(np.where(confs)[0])
+                                min_y = np.min(np.where(confs)[1])
+                                max_y = np.max(np.where(confs)[1])
+                                final_sim = final_sim[min_x:max_x, min_y:max_y]
+                            final_sim = final_sim.transpose((1, 0, 2))
+                            final_sim = np.flip(final_sim, axis=0)
+                            cv2.imwrite(f"{self.results_path}/similarities/final_sim_{episode.episode_id}_{sequence_id}.png", final_sim)
+                        except Exception as e:
+                            print(f"Warning: Could not save similarity image: {e}")
                         # Create the plot
                         plt.figure(figsize=(10, 10))
                         poses_ = np.array([self.actor.mapper.one_map.metric_to_px(*pos[:2]) for pos in poses])

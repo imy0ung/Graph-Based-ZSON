@@ -177,13 +177,14 @@ def filter_out_small_unexplored(
 def detect_frontiers(
         full_map: np.ndarray, explored_mask: np.ndarray, known_th, area_thresh: Optional[int] = -1
 ) -> List[np.ndarray]:
-    """Detects frontiers in a map.
+    """Detects frontiers in a map (VLFM classical style: explored vs unexplored).
 
     Args:
         full_map (np.ndarray): White polygon on black image, where white is navigable.
         Mono-channel mask.
         explored_mask (np.ndarray): Portion of white polygon that has been seen already.
         This is also a mono-channel mask.
+        known_th: Deprecated parameter, kept for compatibility. Not used in VLFM style.
         area_thresh (int, optional): Minimum unexplored area (in pixels) needed adjacent
         to a frontier for that frontier to be valid. Defaults to -1.
 
@@ -193,13 +194,18 @@ def detect_frontiers(
     # Find the contour of the explored area
     full_map *= 255
     explored_mask *= 255
-    # full_map[known_th == 0] = 0
-    # explored_mask = cv2.dilate(
-    #     explored_mask.astype(np.uint8),
-    #     np.ones((2, 2), np.uint8),
-    #     iterations=1,
-    # )
+    # Note: known_th parameter is not used in VLFM classical frontier definition
+    # VLFM style: explored (any observation) vs unexplored (no observation)
     explored_mask[full_map == 0] = 0
+    
+    # VLFM style: Dilate the explored area slightly to prevent small gaps between the explored
+    # area and the unnavigable area from being detected as frontiers.
+    explored_mask = cv2.dilate(
+        explored_mask.astype(np.uint8),
+        np.ones((5, 5), np.uint8),
+        iterations=1,
+    )
+    
     filtered_explored_mask = filter_out_small_unexplored(
         full_map, explored_mask, area_thresh
     )
@@ -207,7 +213,7 @@ def detect_frontiers(
         filtered_explored_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE
     )
     unexplored_mask = np.where(filtered_explored_mask > 0, 0, full_map)
-    # unexplored_mask[known_th == 0] = 0
+    # Note: known_th filtering is not used in VLFM style
     unexplored_mask = cv2.blur(  # blurring for some leeway
         np.where(unexplored_mask > 0, 255, unexplored_mask), (5, 5)
     )

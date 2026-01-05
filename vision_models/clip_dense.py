@@ -8,6 +8,7 @@ import detectron2.data.transforms as T
 from torch.nn import functional as F
 from fvcore.common.checkpoint import Checkpointer
 import open_clip
+import os
 import torch
 
 # Visualization
@@ -21,6 +22,41 @@ try:
 except:
     print("TensorRT not available, cannot use Jetson")
 
+DEBUG_TEXT_ENCODER = False
+
+
+def debug_text_encoder_sanity() -> None:
+    """
+    Minimal self-check for text embedding.
+    """
+    texts = [
+        "bed",
+        "a bed",
+        "a photo of a bed",
+        "exit sign",
+        "a photo of an exit sign",
+        "airplane",
+        "a photo of an airplane",
+    ]
+    model = ClipModel("weights/clip.pth", jetson=False)
+    print("[CLIP_SANITY] device:", model.device)
+    if hasattr(model, "clip_model"):
+        print("[CLIP_SANITY] model dtype:", next(model.clip_model.parameters()).dtype)
+    E = model.get_text_features(texts)
+    print("[CLIP_SANITY] encode_texts shape:", getattr(E, "shape", None))
+    print("[CLIP_SANITY] dtype:", getattr(E, "dtype", None))
+    import numpy as np
+    E_np = np.asarray(E)
+    norms = np.linalg.norm(E_np, axis=1)
+    print("[CLIP_SANITY] norms:", norms)
+    print("[CLIP_SANITY] min/max:", float(E_np.min()), float(E_np.max()))
+    assert E_np.ndim == 2, "Expected 2D array (N,D)"
+    assert E_np.shape[1] >= 256, (
+        f"Embedding dim too small: {E_np.shape[1]} (should be real CLIP dim like 512)"
+    )
+    assert np.all(np.isfinite(E_np)), "Found NaN/Inf in embeddings"
+    assert np.all(norms > 1e-6), "Found zero-norm embedding(s) -> tokenizer/encoder failure"
+
 class ClipModel(torch.nn.Module, BaseModel):
     def __init__(self,
                  path: str,
@@ -28,6 +64,7 @@ class ClipModel(torch.nn.Module, BaseModel):
                  ):
         super(ClipModel, self).__init__()
         self.jetson = jetson
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         self.input_format = "RGB"
 
@@ -57,14 +94,17 @@ class ClipModel(torch.nn.Module, BaseModel):
             clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(
                 name,
                 pretrained=pretrain,
-                device="cuda", )
+                device=self.device, )
             checkpointer = Checkpointer(clip_model)
-            checkpointer.load(path)
+            if path and os.path.isfile(path):
+                checkpointer.load(path)
+            else:
+                print(f"[CLIP] Warning: Checkpoint {path} not found. Using default pretrained weights.")
             self.clip_model = clip_model.float()
             self.clip_model.eval()
-            self.clip_mean = torch.Tensor([122.7709383, 116.7460125, 104.09373615]).to("cuda")
+            self.clip_mean = torch.Tensor([122.7709383, 116.7460125, 104.09373615]).to(self.device)
             self.clip_mean = self.clip_mean.unsqueeze(-1).unsqueeze(-1)
-            self.clip_std = torch.Tensor([68.5005327, 66.6321579, 70.3231630]).to("cuda")
+            self.clip_std = torch.Tensor([68.5005327, 66.6321579, 70.3231630]).to(self.device)
             self.clip_std = self.clip_std.unsqueeze(-1).unsqueeze(-1)
 
     def eval(self):
@@ -200,7 +240,7 @@ class ClipModel(torch.nn.Module, BaseModel):
                 return self.image_forward_trt(transformed)
             else:
                 # images = torch.as_tensor(transformed.astype("float32")).to("cuda")
-                transformed = torch.as_tensor(transformed.astype("float32")).to("cuda")
+                transformed = torch.as_tensor(transformed.astype("float32")).to(self.device)
 
                 return self.image_forward_torch(transformed)
 
@@ -209,61 +249,23 @@ class ClipModel(torch.nn.Module, BaseModel):
                           ) -> torch.Tensor:
         with torch.no_grad():
             texts = self.tokenizer(texts)
+            if DEBUG_TEXT_ENCODER:
+                print("[CLIP_ENC_DBG] tokens shape:", texts.shape)
 
             # print(texts.shape)
             # print(texts.dtype)
             # After, differentiate between jetson and normal
 
             if self.jetson:
-                return self.text_forward_trt(texts)
+                out = self.text_forward_trt(texts)
             else:
-                class_embeddings = self.clip_model.encode_text(texts.to("cuda"))
-                return F.normalize(class_embeddings, dim=1)
+                class_embeddings = self.clip_model.encode_text(texts.to(self.device))
+                out = F.normalize(class_embeddings, dim=1)
+            if DEBUG_TEXT_ENCODER:
+                print("[CLIP_ENC_DBG] raw text features shape:", class_embeddings.shape)
+                print("[CLIP_ENC_DBG] final embedding shape:", out.shape)
+            return out
 
 
 if __name__ == "__main__":
-    import time
-    use_jetson = False
-    N = 1
-    import cv2
-    # start = torch.cuda.Event(enable_timing=True)
-    # end = torch.cuda.Event(enable_timing=True)
-    clip = ClipModel('../weights/clip.pth', use_jetson) # Jetson
-    img = read_image('rgb.jpg', format="RGB")
-    # img = read_image('/home/finn/drafting/CLIPTest/sim2.png', format="RGB")
-    # img = read_image('/home/Pictures/chair.png', format="RGB")
-    # img = read_image('/home/spot/chair.png', format="RGB")
-    # img = cv2.resize(img, (640, 640))
-    img = img.transpose(2, 0, 1)
-    img_feats_ = clip.get_image_features(img)
-    # print(img_feats_)
-    # text_feats = clip.encode_text("A photo of a robot endeffector")
-
-    # start.record()
-    # Perform N iterations and measure overall time
-    print("a")
-    start_time = time.time()
-    for i in range(N):
-        # img[:, i*5:(i+1*5)] -= i
-        img_feats = clip.get_image_features(img)
-        # print(img_feats.sum())
-        # print(img_feats.sum())
-        torch.cuda.synchronize()  # Synchronize after each forward pass
-
-    end_time = time.time()
-    # Compute overall time and average time per iteration
-    total_time = end_time - start_time
-    avg_time_per_iteration = total_time / N
-    # end.record()
-
-    print(f"Total time for {N} iterations: {total_time:.4f} seconds")
-    print(f"Average time per iteration: {avg_time_per_iteration:.4f} seconds")    # clip = ClipModel('weights/clip.pth', False) # Jetson
-    txt_feats = clip.get_text_features(["a chair"])
-    sim = clip.compute_similarity(img_feats, txt_feats)
-    print(sim.max(), sim.min(), sim.mean())
-    fig, axs = plt.subplots(1, 2)
-    axs[0].imshow(sim[0].detach().cpu())
-    axs[1].imshow(img.transpose(1, 2, 0))
-    plt.savefig("plant.png")
-    plt.show()
-    # print(img_feats.shape, text_feats.shape)
+    debug_text_encoder_sanity()

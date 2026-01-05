@@ -1,6 +1,8 @@
 __all__ = [
     'OneMap',
     'Navigator',
+    'PoseGraph', 'PoseNode', 'PoseEdge', 'PoseGraphDB',
+    'Edge', 'BaseNode', 'ObjectNode', 'FrontierNode', 'RegionNode',
     'FusionType',
     'DenseProjectionType',
     'gaussian_kernel',
@@ -26,6 +28,10 @@ from .varying_blur import gaussian_kernel, local_gaussian_blur, gaussian_kernel_
                             precompute_gaussian_kernel_components, compute_gaussian_kernel_components
 
 from .feature_map import OneMap, FusionType, DenseProjectionType
+from .pose_graph import PoseGraph, PoseNode, Edge, BaseNode, ObjectNode, FrontierNode, RegionNode
+# 호환성을 위해 Edge를 PoseEdge로도 export
+PoseEdge = Edge
+from .pose_graph_db import PoseGraphDB
 
 from .navigator import Navigator
 
