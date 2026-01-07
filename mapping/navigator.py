@@ -147,10 +147,8 @@ class Navigator:
 
         self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
         
-        # Initialize pose graph with database support
-        db_path = getattr(config, 'pose_graph_db_path', 'pose_graph.db')
-        session_name = getattr(config, 'session_name', f"session_{int(time.time())}")
-        self.pose_graph = PoseGraph(db_path=db_path, session_name=session_name)
+        # Initialize pose graph (in-memory for ddafce5-like behavior)
+        self.pose_graph = PoseGraph(db_path=None, session_name=None)
 
         self.query_text = ["Other."]
         self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)

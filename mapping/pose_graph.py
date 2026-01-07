@@ -996,6 +996,7 @@ class PoseGraph:
             # CLIP 점수 누적
             if clip_score is not None:
                 updated_obj.clip_scores.append(clip_score)
+            self._apply_semantic_decay(updated_obj)
             
             # Keep object even if confidence is low; let confidence keep adapting.
             min_observations_for_check = 2
@@ -1053,6 +1054,8 @@ class PoseGraph:
             )
             self._add_edge(edge)
 
+            self._apply_semantic_decay(obj_node)
+
             # Save to database if available
             if self.db:
                 try:
@@ -1071,6 +1074,7 @@ class PoseGraph:
         distance_threshold: float = 3.0,
         use_kalman: bool = True,
         mahalanobis_threshold: float = 3.0,
+        use_hungarian: bool = False,
         sim_threshold: float = 0.0,
         w_geo: float = 1.0,
         w_app: float = 1.0,
@@ -1100,6 +1104,23 @@ class PoseGraph:
         
         if not observations:
             return []
+
+        if not use_hungarian:
+            results: List[Optional[ObjectNode]] = []
+            # Greedy matching (ddafce5-style)
+            for obs in observations:
+                obj_node = self.add_object_node(
+                    pose_id=pose_id,
+                    label=obs["label"],
+                    position_w=obs["position_w"],
+                    confidence=obs["confidence"],
+                    embedding=obs.get("embedding"),
+                    step=step or self._step_counter,
+                    distance_threshold=distance_threshold,
+                    clip_score=obs.get("clip_score"),
+                )
+                results.append(obj_node)
+            return results
         
         matches, unmatched_obs_idx, _ = self._associate_observations_hungarian(
             observations=observations,

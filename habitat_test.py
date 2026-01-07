@@ -50,7 +50,7 @@ if __name__ == "__main__":
     # Initialize database - reset for each run
     db_path = "pose_graph.db"
     if Path(db_path).exists():
-        # print(f"Removing existing database: {db_path}")
+        print(f"Removing existing database: {db_path}")
         Path(db_path).unlink()
     
     model = ClipModel("weights/clip.pth")
@@ -121,9 +121,9 @@ if __name__ == "__main__":
     categories = [ob.category.name() for ob in objects]
     scene_categories = sim.semantic_scene.categories
     scene_categories = [cat.name() for cat in scene_categories]
-    # for cat in categories:
-        # if cat not in scene_categories:
-            # print("Object category not in scene categories:", cat)
+    for cat in categories:
+        if cat not in scene_categories:
+            print("Object category not in scene categories:", cat)
 
     for cat in scene_categories:
         if cat not in categories:
@@ -215,24 +215,31 @@ if __name__ == "__main__":
         
         # Print nav_goals coordinates for debugging (every 10 steps)
         if mapper.pose_graph._step_counter % 10 == 0:
-            # print(f"\n[Step {mapper.pose_graph._step_counter}] Nav Goals ({len(mapper.nav_goals)} total):")
-            # for i, nav_goal in enumerate(mapper.nav_goals): # cluster 삭제 필요 (코드 수정 필요)
-            #     coord = nav_goal.get_descr_point()
-            #     score = nav_goal.get_score()
-            #     goal_type = type(nav_goal).__name__
-            #     if goal_type == "Frontier":
-            #         print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
-            pass
+            print(f"\n[Step {mapper.pose_graph._step_counter}] Nav Goals ({len(mapper.nav_goals)} total):")
+            for i, nav_goal in enumerate(mapper.nav_goals): # cluster 삭제 필요 (코드 수정 필요)
+                coord = nav_goal.get_descr_point()
+                score = nav_goal.get_score()
+                goal_type = type(nav_goal).__name__
+                if goal_type == "Frontier":
+                    print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
         
         # Print graph statistics periodically
         if mapper.pose_graph._step_counter % 10 == 0:
-            # stats = mapper.pose_graph.get_statistics()
-            # print(f"\n[Step {mapper.pose_graph._step_counter}] Graph Stats:")
-            # print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "
-            #       f"Edges: {stats['edge_count']} (pose_pose: {stats['pose_pose_edges']}, "
-            #       f"pose_object: {stats['pose_object_edges']})")
-            # 
+            stats = mapper.pose_graph.get_statistics()
+            print(f"\n[Step {mapper.pose_graph._step_counter}] Graph Stats:")
+            print(f"  Poses: {stats['pose_nodes']}, Objects: {stats['object_nodes']}, "
+                  f"Edges: {stats['edge_count']} (pose_pose: {stats['pose_pose_edges']}, "
+                  f"pose_object: {stats['pose_object_edges']})")
+
             if len(mapper.pose_graph.object_ids) > 0:
+                print(f"  Registered Objects:")
+                for obj_id in mapper.pose_graph.object_ids:
+                    obj_node = mapper.pose_graph.nodes[obj_id]
+                    clip_info = f", clip={obj_node.avg_clip_score:.3f}" if obj_node.clip_scores else ", clip=N/A"
+                    verified_mark = "✓" if obj_node.clip_verified else "✗" if obj_node.clip_scores else "?"
+                    print(f"    - {obj_node.label} [{verified_mark}]: pos=({obj_node.position[0]:.2f}, {obj_node.position[1]:.2f}), "
+                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}{clip_info}")
+
                 max_print = 10
                 obj_ids = mapper.pose_graph.object_ids[-max_print:]
                 print(f"\n[Step {mapper.pose_graph._step_counter}] Objects (showing {len(obj_ids)}/{len(mapper.pose_graph.object_ids)}):")
@@ -254,12 +261,11 @@ if __name__ == "__main__":
                         f"sim_in={sim_in_str} sim_out={sim_out_str} "
                         f"margin={sim_margin_str} outdoor={is_outdoor}"
                     )
-        
+
         # Print target object info if navigating to graph-based target
         if mapper.target_object_node is not None:
-            # print(f"[Target] Navigating to '{mapper.target_object_node.label}' "
-            #       f"at ({mapper.target_object_node.position[0]:.2f}, {mapper.target_object_node.position[1]:.2f})")
-            pass
+            print(f"[Target] Navigating to '{mapper.target_object_node.label}' "
+                  f"at ({mapper.target_object_node.position[0]:.2f}, {mapper.target_object_node.position[1]:.2f})")
 
         cam_x = pos[0, 0]
         cam_y = pos[1, 0]
@@ -307,15 +313,15 @@ if __name__ == "__main__":
                            rr.LineStrips2D(circle_strips, 
                                          colors=[green_color] * len(circle_strips)))
         if obj_found:
-            # print(f"Object '{mapper.query_text[0]}' found! Moving to next object...")
+            print(f"Object '{mapper.query_text[0]}' found! Moving to next object...")
             if len(qs) > 0:
                 next_obj = qs[0]
                 qs.pop(0)
                 mapper.set_query([next_obj])
-                # print(f"Now searching for: {next_obj}")
+                print(f"Now searching for: {next_obj}")
             else:
                 # All objects found, exit
-                # print("All target objects found. Exiting...")
+                print("All target objects found. Exiting...")
                 running = False
                 break
             # Continue to next iteration to start searching for new object
@@ -323,6 +329,6 @@ if __name__ == "__main__":
         
         # Exit if no more queries and no path
         if len(qs) == 0 and (mapper.get_path() is None or len(mapper.get_path()) == 0):
-            # print("No more queries and no path. Exiting...")
+            print("No more queries and no path. Exiting...")
             running = False
             break
