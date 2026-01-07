@@ -1,0 +1,66 @@
+# ignore all .pngs
+*.png
+weights/*
+
+# Pycache
+**__pycache__**
+results*/
+*.pt
+yolov7
+weights
+datasets
+
+# Python 관련
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# 가상환경
+venv/
+env/
+ENV/
+
+# IDE 관련
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# 로그 파일
+*.log
+
+# 임시 파일
+.DS_Store
+Thumbs.db
+*.tmp
+
+# 결과 파일
+*.rrd
+
+# 캐시
+.cache/
+
+# 데이터베이스 파일
+*.db
+pose_graph.db
+
+# Secrets
+.env
+
+# Large Model Weights
+*.pt
+*.pth
+weights/
+
+# Cache & Results
+*.npz
+results/
+
+# Modules to ignore
+frontier_exploration/
