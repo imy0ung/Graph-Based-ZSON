@@ -118,6 +118,12 @@ class HabitatEvaluator:
         if self.actor is not None:
             self.logger = rerun_logger.RerunLogger(self.actor.mapper, False, "") if self.log_rerun else None
         self.results_path = "/home/finn/active/MON/results_gibson" if self.is_gibson else "results/"
+        self._ensure_results_dirs()
+
+    def _ensure_results_dirs(self) -> None:
+        base = self.results_path
+        for subdir in ("", "trajectories", "similarities", "state"):
+            os.makedirs(os.path.join(base, subdir), exist_ok=True)
 
     def load_scene(self, scene_id: str):
         if self.sim is not None:

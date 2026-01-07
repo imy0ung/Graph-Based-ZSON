@@ -51,7 +51,7 @@ class MONActor(Actor):
             # self.policy = WrappedPointNavResNetPolicy("/home/finn/External/vlfm/pointnav.pth", "/home/finn/External/vlfm/pointnav_conf.pth", "cuda")
 
         self.mapper = Navigator(model, detector, config)
-        
+
         # Initialize semantic prototypes for semantic decay algorithm
         proto_config = PrototypeConfig()
         proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
