@@ -71,12 +71,12 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["toilet", "bed", "couch"]
+    qs =["bed"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
-    backend_cfg = habitat_sim.SimulatorConfiguration()
+    backend_cfg = habitat_sim.SimulatorConfiguration() 
     backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
@@ -222,6 +222,23 @@ if __name__ == "__main__":
                 goal_type = type(nav_goal).__name__
                 if goal_type == "Frontier":
                     print(f"  [{i}] {goal_type}: coord=({coord[0]:.2f}, {coord[1]:.2f}), score={score:.4f}")
+            
+            # =====================================================================
+            # Bayesian Frontier Score Debug Output
+            # Shows P(R|F) room probabilities and Bayesian scores for each frontier
+            # =====================================================================
+            if hasattr(mapper, 'bayesian_scorer') and mapper.bayesian_scorer is not None:
+                print(f"\n[Step {mapper.pose_graph._step_counter}] Bayesian Frontier Analysis:")
+                print(f"  Target Object: {mapper.query_text[0] if mapper.query_text else 'N/A'}")
+                print(f"  Bayesian Scoring: {'Enabled' if mapper.use_bayesian_frontier else 'Disabled'}")
+                
+                # Print object prior P(O|R) for current target
+                if mapper.query_text:
+                    target = mapper.query_text[0]
+                    object_prior = mapper.bayesian_scorer.get_object_prior(target)
+                    top_room_idx = object_prior.argmax()
+                    from vision_models.bayesian_frontier_scorer import ROOM_CATEGORIES
+                    print(f"  Object Prior P({target}|R): top room = {ROOM_CATEGORIES[top_room_idx]} ({object_prior[top_room_idx]:.3f})")
         
         # Print graph statistics periodically
         if mapper.pose_graph._step_counter % 10 == 0:
@@ -235,10 +252,11 @@ if __name__ == "__main__":
                 print(f"  Registered Objects:")
                 for obj_id in mapper.pose_graph.object_ids:
                     obj_node = mapper.pose_graph.nodes[obj_id]
-                    clip_info = f", clip={obj_node.avg_clip_score:.3f}" if obj_node.clip_scores else ", clip=N/A"
+                    # clip_score 변수명은 호환성 유지 (실제로는 SigLIP2 점수)
+                    siglip_info = f", siglip={obj_node.avg_clip_score:.3f}" if obj_node.clip_scores else ", siglip=N/A"
                     verified_mark = "✓" if obj_node.clip_verified else "✗" if obj_node.clip_scores else "?"
                     print(f"    - {obj_node.label} [{verified_mark}]: pos=({obj_node.position[0]:.2f}, {obj_node.position[1]:.2f}), "
-                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}{clip_info}")
+                          f"conf={obj_node.confidence:.2f}, obs={obj_node.num_observations}{siglip_info}")
 
                 max_print = 10
                 obj_ids = mapper.pose_graph.object_ids[-max_print:]
