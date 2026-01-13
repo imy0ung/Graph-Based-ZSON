@@ -183,8 +183,28 @@ class BayesianFrontierScorer:
         if obj_key in self.prior_matrix:
             return self.prior_matrix[obj_key]
         
-        # Fallback: uniform distribution if object not found
-        print(f"[BayesianScorer] Warning: Object '{target_object}' not in prior matrix. Using uniform.")
+        # Fallback: use text similarity to find closest object in prior matrix
+        if self.siglip_classifier is not None:
+            candidates = list(self.prior_matrix.keys())
+            match_result = self.siglip_classifier.find_best_match(obj_key, candidates, return_score=True)
+            
+            if match_result is not None:
+                best_match, score = match_result
+                # Threshold for accepting a match (e.g., 0.8)
+                if score > 0.8:
+                    print(f"[BayesianScorer] Fallback: '{target_object}' not found. "
+                          f"Using prior for '{best_match}' (similarity: {score:.3f})")
+                    # Cache the result for future use
+                    self.prior_matrix[obj_key] = self.prior_matrix[best_match]
+                    return self.prior_matrix[obj_key]
+                else:
+                    print(f"[BayesianScorer] Warning: '{target_object}' not found. "
+                          f"Best match '{best_match}' score {score:.3f} too low. Using uniform.")
+            else:
+                print(f"[BayesianScorer] Warning: '{target_object}' not found and matching failed. Using uniform.")
+        else:
+            print(f"[BayesianScorer] Warning: Object '{target_object}' not in prior matrix. Using uniform.")
+            
         return np.ones(len(ROOM_CATEGORIES), dtype=np.float32) / len(ROOM_CATEGORIES)
     
     def compute_room_probabilities(self, frontier_image: np.ndarray) -> np.ndarray:

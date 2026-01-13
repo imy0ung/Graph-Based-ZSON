@@ -1925,6 +1925,10 @@ class Navigator:
         path_distances_meters = []  # For distance penalty
         frontier_node_ids = []  # For hysteresis matching
         
+        # Track which frontiers need computation vs cached
+        frontiers_to_compute_indices = []  # Indices in results list that need computation
+        cached_room_probs = []  # Store cached probs, None for those needing computation
+        
         for frontier_node in frontier_nodes:
             if frontier_node.coarse_embedding is None and self.current_image is None:
                 continue
@@ -1968,6 +1972,17 @@ class Navigator:
             # Track frontier node ID for hysteresis
             frontier_node_ids.append(frontier_node.id)
             
+            # Check if we have cached room probabilities
+            if frontier_node.room_probs is not None:
+                # Use cached probability
+                cached_room_probs.append(frontier_node.room_probs)
+                results.append((frontier_node, goal_point_px, candidate_path, is_reachable))
+                continue
+            
+            # No cache - prepare for computation
+            cached_room_probs.append(None)  # Placeholder
+            frontiers_to_compute_indices.append(len(results))
+            
             # Extract frontier observation image for SigLIP2
             frontier_img = self._extract_frontier_observation_image(
                 frontier_node.position,
@@ -1982,14 +1997,41 @@ class Navigator:
                     pil_img = pil_img.resize((224, 224), Image.BILINEAR)
                     frontier_img = np.array(pil_img)
                 else:
-                    # Skip this frontier
+                    # Skip this frontier (remove from tracking lists)
+                    frontier_paths.pop()
+                    reachability.pop()
+                    path_distances_meters.pop()
+                    frontier_node_ids.pop()
+                    cached_room_probs.pop()
+                    frontiers_to_compute_indices.pop()
                     continue
             
             frontier_images.append(frontier_img)
             results.append((frontier_node, goal_point_px, candidate_path, is_reachable))
         
-        if len(frontier_images) == 0:
+        if len(results) == 0:
             return []
+            
+        # Batch compute room probabilities for new frontiers
+        if len(frontier_images) > 0:
+            new_room_probs = self.bayesian_scorer.siglip_classifier.classify_batch(frontier_images)
+            
+            # Fill in computed probabilities and update cache
+            for i, idx in enumerate(frontiers_to_compute_indices):
+                probs = new_room_probs[i]
+                cached_room_probs[idx] = probs
+                # Update FrontierNode cache
+                results[idx][0].room_probs = probs
+                
+        # Verify all probabilities are available
+        final_room_probs = []
+        for probs in cached_room_probs:
+            if probs is None:
+                # Should not happen if logic is correct
+                print("[BayesianScorer] Warning: Missing room probabilities after computation")
+                final_room_probs.append(np.ones(10) / 10.0) # Uniform fallback
+            else:
+                final_room_probs.append(probs)
         
         # Find previous target index for hysteresis bonus
         previous_target_idx = None
@@ -1999,14 +2041,53 @@ class Navigator:
                     previous_target_idx = idx
                     break
         
-        # Batch score all frontiers using Bayesian scorer with anti-oscillation features
-        frontier_scores = self.bayesian_scorer.score_frontiers_batch(
-            frontier_images,
-            target_object,
-            reachability,
-            path_distances_meters=path_distances_meters,
-            previous_target_idx=previous_target_idx,
-        )
+        # We need to manually construct FrontierScore objects because score_frontiers_batch 
+        # expects images and re-computes probabilities.
+        # Instead, we'll use a modified approach or manually score each.
+        # Since we already have room_probs, we can use score_frontier logic directly or 
+        # create a new method in scorer that accepts pre-computed probs.
+        # For now, let's implement the scoring logic here using the scorer's helper methods
+        # to avoid modifying the scorer interface too much, or we can just reconstruct the scores.
+        
+        object_prior = self.bayesian_scorer.get_object_prior(target_object)
+        frontier_scores = []
+        
+        for i, (room_probs, is_reachable, path_dist) in enumerate(
+            zip(final_room_probs, reachability, path_distances_meters)
+        ):
+            # Compute Bayesian score
+            bayesian_score = float(np.sum(object_prior * room_probs))
+            
+            # Compute Gateway bonus
+            top_room_idx = np.argmax(room_probs)
+            if top_room_idx == self.bayesian_scorer.HALL_STAIRWELL_IDX:
+                target_room_idx = np.argmax(object_prior)
+                gateway_bonus = float(self.bayesian_scorer.GATEWAY_ALPHA * object_prior[target_room_idx])
+            else:
+                gateway_bonus = 0.0
+            
+            # Compute distance penalty (Anti-oscillation)
+            distance_penalty = self.bayesian_scorer.DISTANCE_PENALTY_COEFF * path_dist
+            
+            # Compute hysteresis bonus (Anti-oscillation)
+            is_previous_target = (previous_target_idx is not None and i == previous_target_idx)
+            hysteresis_bonus = self.bayesian_scorer.HYSTERESIS_BONUS if is_previous_target else 0.0
+            
+            # Total score with anti-oscillation adjustments
+            total_score = bayesian_score + gateway_bonus - distance_penalty + hysteresis_bonus
+            
+            frontier_scores.append(FrontierScore(
+                frontier_id=i,
+                bayesian_score=bayesian_score,
+                room_probs=room_probs,
+                top_room=ROOM_CATEGORIES[top_room_idx],
+                top_room_prob=float(room_probs[top_room_idx]),
+                gateway_bonus=gateway_bonus,
+                distance_penalty=distance_penalty,
+                hysteresis_bonus=hysteresis_bonus,
+                total_score=total_score,
+                is_reachable=is_reachable,
+            ))
         
         # Combine results
         scored_results = []

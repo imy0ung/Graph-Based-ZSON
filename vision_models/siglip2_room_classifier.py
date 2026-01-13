@@ -8,7 +8,7 @@ frontier images into room categories for ZSON (Zero-Shot Object Navigation).
 import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Union
 from PIL import Image
 
 # HuggingFace transformers
@@ -372,6 +372,82 @@ class SigLIP2RoomClassifier:
         except Exception as e:
             print(f"[SigLIP Verification] Error: {e}")
             return None
+
+
+    def compute_text_embedding(self, text: str) -> Optional[np.ndarray]:
+        """
+        Compute normalized text embedding for a single string.
+        
+        Args:
+            text: Input text string
+            
+        Returns:
+            Normalized embedding as numpy array (D,) or None if error
+        """
+        try:
+            with torch.no_grad():
+                if self._is_clip:
+                    text_inputs = self.processor(
+                        text=[text],
+                        padding=True,
+                        truncation=True,
+                        return_tensors="pt",
+                    ).to(self.device)
+                    text_outputs = self.model.get_text_features(**text_inputs)
+                else:
+                    text_inputs = self.processor(
+                        text=[text],
+                        padding="max_length",
+                        truncation=True,
+                        return_tensors="pt",
+                    ).to(self.device)
+                    text_outputs = self.model.get_text_features(**text_inputs)
+                
+                embedding = F.normalize(text_outputs, dim=-1)
+                return embedding.cpu().numpy().squeeze()
+        except Exception as e:
+            print(f"[SigLIP] Text embedding error: {e}")
+            return None
+
+    def find_best_match(
+        self, 
+        query: str, 
+        candidates: List[str],
+        return_score: bool = False
+    ) -> Union[str, Tuple[str, float], None]:
+        """
+        Find the best matching candidate string for a query using semantic similarity.
+        
+        Args:
+            query: Query string
+            candidates: List of candidate strings
+            return_score: If True, return tuple (best_match, score)
+            
+        Returns:
+            Best matching string, or (string, score) tuple, or None if error/empty
+        """
+        if not candidates:
+            return None
+            
+        query_embedding = self.compute_text_embedding(query)
+        if query_embedding is None:
+            return None
+            
+        best_score = -1.0
+        best_match = None
+        
+        # Compute embeddings for candidates (could be batched for efficiency, but list is usually small)
+        for candidate in candidates:
+            cand_embedding = self.compute_text_embedding(candidate)
+            if cand_embedding is not None:
+                score = np.dot(query_embedding, cand_embedding)
+                if score > best_score:
+                    best_score = score
+                    best_match = candidate
+                    
+        if return_score:
+            return best_match, float(best_score)
+        return best_match
 
 
 if __name__ == "__main__":

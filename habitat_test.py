@@ -71,13 +71,13 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["bed"]
+    qs =["plant"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration() 
-    backend_cfg.scene_id = hm3d_path + "/val/00853-5cdEh9F2hJL/5cdEh9F2hJL.basis.glb"
+    backend_cfg.scene_id = hm3d_path + "/val/00876-mv2HUxq3B53/mv2HUxq3B53.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
 
