@@ -450,6 +450,40 @@ class SigLIP2RoomClassifier:
             return best_match, float(best_score)
         return best_match
 
+    def get_text_features(self, texts: List[str]) -> torch.Tensor:
+        """
+        Compute normalized text embeddings for a list of strings.
+        Compatible with SemanticPrototypeIndex.
+        
+        Args:
+            texts: List of input text strings
+            
+        Returns:
+            Normalized embeddings as torch.Tensor of shape (N, D)
+        """
+        if not texts:
+            return torch.empty(0, device=self.device)
+            
+        with torch.no_grad():
+            if self._is_clip:
+                text_inputs = self.processor(
+                    text=texts,
+                    padding=True,
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(self.device)
+                text_outputs = self.model.get_text_features(**text_inputs)
+            else:
+                text_inputs = self.processor(
+                    text=texts,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                ).to(self.device)
+                text_outputs = self.model.get_text_features(**text_inputs)
+            
+            return F.normalize(text_outputs, dim=-1)
+
 
 if __name__ == "__main__":
     # Test the SigLIP2 room classifier

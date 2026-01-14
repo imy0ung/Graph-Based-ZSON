@@ -59,6 +59,18 @@ if __name__ == "__main__":
     #detector = YOLOWorldDetector(0.8)
     detector = YOLOv7Detector(0.8)
     mapper = Navigator(model, detector, config)
+    
+    # Restore SemanticPrototypeIndex using SigLIP2
+    # Since we removed CLIP, we use the SigLIP2 classifier from the Bayesian scorer as the text encoder.
+    if mapper.bayesian_scorer is not None and mapper.bayesian_scorer.siglip_classifier is not None:
+        print("[HabitatTest] Restoring SemanticPrototypeIndex using SigLIP2...")
+        siglip_model = mapper.bayesian_scorer.siglip_classifier
+        proto_config = PrototypeConfig()
+        proto_index = SemanticPrototypeIndex(siglip_model, config=proto_config, auto_build=False)
+        proto_index.build_or_load(ignore_cache=True)
+        mapper.pose_graph.set_semantic_prototypes(proto_index)
+    else:
+        print("[HabitatTest] Warning: Could not restore SemanticPrototypeIndex (SigLIP2 not found).")
     # proto_config = PrototypeConfig()
     # proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
     # proto_index.build_or_load(ignore_cache=True)
@@ -72,7 +84,7 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["bed"]
+    qs =["toilet"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
