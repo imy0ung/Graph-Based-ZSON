@@ -134,6 +134,7 @@ class SigLIP2RoomClassifier:
             self.processor = AutoProcessor.from_pretrained(
                 model_name,
                 cache_dir=self.cache_dir,
+                use_fast=True,
             )
             self.model = AutoModel.from_pretrained(
                 model_name,

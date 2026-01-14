@@ -48,7 +48,7 @@ def rotate_pcl(
 
     yaw = torch.arctan2(rotation_matrix[1, 0], rotation_matrix[0, 0])
     # print(yaw)
-    r = torch.tensor([[torch.cos(yaw), -torch.sin(yaw)], [torch.sin(yaw), torch.cos(yaw)]], dtype=torch.float32).to("cuda")
+    r = torch.tensor([[torch.cos(yaw), -torch.sin(yaw)], [torch.sin(yaw), torch.cos(yaw)]], dtype=torch.float32).to(pointcloud.device)
     pointcloud[:, :2] = (r @ pointcloud[:, :2].T).T
     return pointcloud
 
@@ -104,7 +104,7 @@ class OneMap:
 
         self.n_cells = config.n_points
         self.map_center_cells = self.map_center_cells = torch.tensor([self.n_cells // 2, self.n_cells // 2],
-                                                                     dtype=torch.int32).to("cuda")
+                                                                     dtype=torch.int32).to(self.map_device)
         self.size = config.size
         self.cell_size = self.size / self.n_cells
         self.feature_dim = feature_dim  # Keep for compatibility, but not used for storage
@@ -136,9 +136,9 @@ class OneMap:
 
         self.kernel_half = int(np.round(config.blur_kernel_size / self.cell_size))
         self.kernel_size = self.kernel_half * 2 + 1
-        self.kernel_components_sum = precompute_gaussian_sum_els(self.kernel_size).to("cuda")
-        self.kernel_components = precompute_gaussian_kernel_components(self.kernel_size).to("cuda")
-        self.kernel_ids = torch.arange(-self.kernel_half, self.kernel_half + 1).to("cuda")
+        self.kernel_components_sum = precompute_gaussian_sum_els(self.kernel_size).to(self.map_device)
+        self.kernel_components = precompute_gaussian_kernel_components(self.kernel_size).to(self.map_device)
+        self.kernel_ids = torch.arange(-self.kernel_half, self.kernel_half + 1).to(self.map_device)
         self.kernel_ids_x, self.kernel_ids_y = torch.meshgrid(self.kernel_ids, self.kernel_ids)
         self.kernel_ids_x = self.kernel_ids_x.unsqueeze(0)
         self.kernel_ids_y = self.kernel_ids_y.unsqueeze(0)
@@ -228,7 +228,7 @@ class OneMap:
         elif len(values.shape) == 3:
             values = values.permute(1, 2, 0)  # feature_dim last for convenience
             (observed_cell_indices,
-             obstacle_mapped, obstcl_confidence_mapped) = self.project_dense(values, torch.Tensor(depth).to("cuda"),
+             obstacle_mapped, obstcl_confidence_mapped) = self.project_dense(values, torch.Tensor(depth).to(self.map_device),
                                                                              torch.tensor(tf_camera_to_episodic),
                                                                              self.fx, self.fy,
                                                                              self.cx, self.cy)
@@ -346,15 +346,19 @@ class OneMap:
                  obstcl_confidence_mapped: sparse COO tensor of obstacle confidences
         """
         # check if values is on cuda
-        if not values.is_cuda:
+        if not values.is_cuda and self.map_device == "cuda":
             print("Warning: Provided value array is not on cuda, which it should be as an output of a model. Moving to "
                   "Cuda, which will slow things down.")
             values = values.to("cuda")
-        if not depth.is_cuda:
+        if not depth.is_cuda and self.map_device == "cuda":
             print(
                 "Warning: Provided depth array is not on cuda, which it could be if is an output of a model. Moving to "
                 "Cuda, which will slow things down.")
             depth = depth.to("cuda")
+        
+        # Ensure data is on the correct device
+        values = values.to(self.map_device)
+        depth = depth.to(self.map_device)
 
         if values.shape[0:2] == depth.shape[0:2]:
             # our values align with the depth pixels
@@ -409,7 +413,7 @@ class OneMap:
 
         rotated_pcl = rotate_pcl(projected_depth, tf_camera_to_episodic)
         cam_x, cam_y = tf_camera_to_episodic[:2, 3] / tf_camera_to_episodic[3, 3]
-        rotated_pcl[:, :2] += torch.tensor([cam_x, cam_y], device='cuda')
+        rotated_pcl[:, :2] += torch.tensor([cam_x, cam_y], device=self.map_device)
 
         values_aligned = values.reshape((-1, values.shape[-1]))
 
@@ -438,7 +442,7 @@ class OneMap:
         combined_data = torch.cat((
             values_to_add,
             mask_obstacle_masked.unsqueeze(1),
-            torch.ones((values_to_add.shape[0], 1), dtype=torch.uint8, device="cuda"),
+            torch.ones((values_to_add.shape[0], 1), dtype=torch.uint8, device=self.map_device),
             scores_masked.unsqueeze(1)),
             dim=1)  # prepare to aggregate doubles (values pointing to the same grid cell)
 
@@ -446,7 +450,7 @@ class OneMap:
         pcl_grid_ids_masked_unique, pcl_mapping = pcl_grid_ids_masked.unique(dim=1, return_inverse=True)
         # coalesce the data
         coalesced_combined_data = torch.zeros((pcl_grid_ids_masked_unique.shape[1], combined_data.shape[-1]),
-                                              dtype=torch.float32, device="cuda")
+                                              dtype=torch.float32, device=self.map_device)
         coalesced_combined_data.index_add_(0, pcl_mapping, combined_data)
 
         # Extract the data
@@ -519,8 +523,8 @@ class OneMap:
                                                           z is vertical (points up)
         """
         # TODO are the "-1" necessary?
-        x = torch.arange(0, depth.shape[1], device="cuda") * (camera_resolution[1] - 1) / (depth.shape[1] - 1)
-        y = torch.arange(0, depth.shape[0], device="cuda") * (camera_resolution[0] - 1) / (depth.shape[0] - 1)
+        x = torch.arange(0, depth.shape[1], device=self.map_device) * (camera_resolution[1] - 1) / (depth.shape[1] - 1)
+        y = torch.arange(0, depth.shape[0], device=self.map_device) * (camera_resolution[0] - 1) / (depth.shape[0] - 1)
         xx, yy = torch.meshgrid(x, y, indexing="xy")
         xx = xx.flatten()
         yy = yy.flatten()

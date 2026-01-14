@@ -53,15 +53,16 @@ if __name__ == "__main__":
         print(f"Removing existing database: {db_path}")
         Path(db_path).unlink()
     
-    model = ClipModel("weights/clip.pth")
+    # model = ClipModel("weights/clip.pth")
+    model = None
     # Target object detector (for navigation)
     #detector = YOLOWorldDetector(0.8)
     detector = YOLOv7Detector(0.8)
     mapper = Navigator(model, detector, config)
-    proto_config = PrototypeConfig()
-    proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
-    proto_index.build_or_load(ignore_cache=True)
-    mapper.pose_graph.set_semantic_prototypes(proto_index)
+    # proto_config = PrototypeConfig()
+    # proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
+    # proto_index.build_or_load(ignore_cache=True)
+    # mapper.pose_graph.set_semantic_prototypes(proto_index)
     logger = rerun_logger.RerunLogger(mapper, False, "", debug=False) if config.log_rerun else None
 
     mapper.debug_observation_distance = True
@@ -71,13 +72,17 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["plant"]
+    qs =["bed"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
 
-    backend_cfg = habitat_sim.SimulatorConfiguration() 
-    backend_cfg.scene_id = hm3d_path + "/val/00876-mv2HUxq3B53/mv2HUxq3B53.basis.glb"
+    backend_cfg = habitat_sim.SimulatorConfiguration()
+    backend_cfg.scene_id = hm3d_path + "/val/00843-DYehNKdT76V/DYehNKdT76V.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00832-qyAac8rV8Zk/qyAac8rV8Zk.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00820-mL8ThkuaVTM/mL8ThkuaVTM.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00878-XB4GS9ShBRE/XB4GS9ShBRE.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00876-mv2HUxq3B53/mv2HUxq3B53.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
 

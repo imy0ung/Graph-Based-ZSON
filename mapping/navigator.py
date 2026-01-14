@@ -137,7 +137,7 @@ class Navigator:
     last_nav_goal: Union[NavGoal, None]
 
     def __init__(self,
-                 model: BaseModel,
+                 model: Optional[BaseModel],
                  detector: YOLOWorldDetector,
                  config: Conf,
                  use_bayesian_frontier: bool = True,
@@ -154,7 +154,8 @@ class Navigator:
         sam_model_t = "vit_t"
         sam_checkpoint = "weights/mobile_sam.pt"
         self.sam = sam_model_registry[sam_model_t](checkpoint=sam_checkpoint)
-        self.sam.to(device="cuda")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.sam.to(device=device)
         self.sam.eval()
         self.sam_predictor = SamPredictor(self.sam)
         
@@ -173,13 +174,24 @@ class Navigator:
                 print("[Navigator] Falling back to legacy frontier selection")
                 self.use_bayesian_frontier = False
 
-        self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
+        # Initialize OneMap
+        # If model is None, we use a dummy feature dim of 1 (instead of 512)
+        # to minimize CPU overhead in OneMap, since we don't use these features anyway.
+        feature_dim = self.model.feature_dim if self.model is not None else 1
+        
+        # Detect device for OneMap
+        map_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Navigator] Initializing OneMap on device: {map_device}")
+        self.one_map = OneMap(feature_dim, config.mapping, map_device=map_device)
         
         # Initialize pose graph (in-memory for ddafce5-like behavior)
         self.pose_graph = PoseGraph(db_path=None, session_name=None)
 
         self.query_text = ["Other."]
-        self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        if self.model is not None:
+            self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        else:
+            self.query_text_features = None
 
         # Current frame image features for frontier embedding extraction
         self.current_image_features: Optional[torch.Tensor] = None
@@ -277,7 +289,10 @@ class Navigator:
 
     def reset(self):
         self.query_text = ["Other."]
-        self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        if self.model is not None:
+            self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        else:
+            self.query_text_features = None
         self.similar_points = None
         self.similar_scores = None
         self.object_detected = False
@@ -329,8 +344,11 @@ class Navigator:
         if txt != self.query_text:
             print(f"Setting query to {txt}")
             self.query_text = txt
-            self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(
-                self.one_map.map_device)
+            if self.model is not None:
+                self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(
+                    self.one_map.map_device)
+            else:
+                self.query_text_features = None
             self.one_map.reset_checked_map()
             self.detector.set_classes(self.query_text)
             # Reset object detection state when query changes (for multi-object navigation)
@@ -377,6 +395,9 @@ class Navigator:
             image_for_clip = image_crop.transpose(2, 0, 1)
             
             # CLIP으로 텍스트 특징 추출 (단일 라벨)
+            if self.model is None:
+                return None
+                
             text_prompt = f"a {detected_label}"
             text_features = self.model.get_text_features([text_prompt])  # [1, F]
             
@@ -710,10 +731,15 @@ class Navigator:
                     else:
                         embedding_tensor = embedding_tensor.unsqueeze(0)
                     
-                    similarity = self.model.compute_similarity(
-                        embedding_tensor.to(self.query_text_features.device),
-                        self.query_text_features
-                    )
+                    if self.model is not None and self.query_text_features is not None:
+                        similarity = self.model.compute_similarity(
+                            embedding_tensor.to(self.query_text_features.device),
+                            self.query_text_features
+                        )
+                    else:
+                        # Fallback if model is missing (shouldn't happen in legacy mode if we want it to work, 
+                        # but safe to return 0)
+                        similarity = torch.tensor([0.0])
                     
                     if similarity.numel() == 1:
                         sim_value = similarity.item()
@@ -1419,7 +1445,14 @@ class Navigator:
                         mahalanobis_threshold=3.0,
                     )
         a = time.time()
-        image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        if self.model is not None:
+            image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        else:
+            # Dummy features if CLIP is not available
+            # OneMap expects features to update the map, but we only care about obstacles
+            # Create a zero tensor of shape (feature_dim, 2, 2) to satisfy OneMap.update expecting >1x1 tensor
+            # (feature_dim, H, W). feature_dim is now 1 for optimization.
+            image_features = torch.zeros((self.one_map.feature_dim, 2, 2), device=self.one_map.map_device, dtype=torch.float32)
         b = time.time()
         
         # Store current frame data for frontier embedding extraction

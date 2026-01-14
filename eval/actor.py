@@ -6,7 +6,7 @@ from typing import Dict, Tuple
 import numpy as np
 
 # MON
-from vision_models.clip_dense import ClipModel
+# from vision_models.clip_dense import ClipModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
 # from vision_models.grounding_dino_detector import GroundingDinoDetector
 # from vision_models.yolov8_model import YoloV8Detector
@@ -39,7 +39,8 @@ class Actor(ABC):
 
 class MONActor(Actor):
     def __init__(self, config):
-        model = ClipModel("weights/clip.pth", jetson=False)
+        # model = ClipModel("weights/clip.pth", jetson=False)
+        model = None
         detector = YOLOWorldDetector(config.planner.yolo_confidence) if config.planner.using_ov \
             else YOLOv7Detector(config.planner.yolo_confidence)
             # else YoloV8Detector(config.planner.yolo_confidence)
@@ -53,10 +54,10 @@ class MONActor(Actor):
         self.mapper = Navigator(model, detector, config)
 
         # Initialize semantic prototypes for semantic decay algorithm
-        proto_config = PrototypeConfig()
-        proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
-        proto_index.build_or_load(ignore_cache=True)
-        self.mapper.pose_graph.set_semantic_prototypes(proto_index)
+        # proto_config = PrototypeConfig()
+        # proto_index = SemanticPrototypeIndex(model, config=proto_config, auto_build=False)
+        # proto_index.build_or_load(ignore_cache=True)
+        # self.mapper.pose_graph.set_semantic_prototypes(proto_index)
 
         self.init = 36*2
         hfov = 90 if self.square else 97
