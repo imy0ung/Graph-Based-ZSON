@@ -682,6 +682,65 @@ class Navigator:
                         all_scores = [score for _, score, _ in bayesian_results]
                         target_obj = self.query_text[0] if self.query_text else "unknown"
                         self.bayesian_scorer.debug_print_scores(all_scores, target_obj)
+                    
+                    # =============================================================
+                    # RELAXED PATH PLANNING (Force Navigation)
+                    # When all frontiers are unreachable, ignore unexplored areas
+                    # and plan paths through them (obstacles still respected)
+                    # =============================================================
+                    if best_frontier_node is None:
+                        print("[Relaxed Planning] All frontiers unreachable. "
+                              "Attempting force navigation (ignoring unexplored areas)...")
+                        
+                        # Force feasible mask: all areas are valid (ignore unexplored)
+                        force_feasible = np.ones_like(self.one_map.explored_area, dtype=np.uint8)
+                        
+                        # Re-score frontiers with relaxed planning (sorted by Bayesian score, highest first)
+                        for frontier_node, score, _ in bayesian_results:
+                            goal_world = frontier_node.position[:2]
+                            goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+                            goal_point_px = np.array([goal_px, goal_py])
+                            
+                            # Skip blacklisted
+                            if len(self.blacklisted_nav_goals) > 0 and np.any(
+                                    np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
+                                continue
+                            
+                            # Force path planning: navigable_map only (obstacles respected, unexplored ignored)
+                            force_path = Planning.compute_to_goal(
+                                start,
+                                self.one_map.navigable_map,  # Only obstacle avoidance
+                                force_feasible,               # Ignore unexplored areas
+                                goal_point_px,
+                                self.obstcl_kernel_size,
+                                self.min_goal_dist
+                            )
+                            
+                            if force_path is not None and len(force_path) > 0:
+                                best_frontier_node = frontier_node
+                                best_bayesian_score = score
+                                best_path = force_path
+                                best_similarity = score.bayesian_score
+                                
+                                # Update score to mark as reachable via relaxed planning
+                                score.is_reachable = True
+                                
+                                print(f"[Relaxed Planning] Found path to frontier at "
+                                      f"({goal_world[0]:.2f}, {goal_world[1]:.2f}) "
+                                      f"with score {score.total_score:.4f} (room: {score.top_room})")
+                                
+                                # Compute path length
+                                path_length_px = 0.0
+                                for i in range(1, len(force_path)):
+                                    segment = np.linalg.norm(
+                                        np.array(force_path[i]) - np.array(force_path[i-1])
+                                    )
+                                    path_length_px += segment
+                                best_path_length = path_length_px * self.one_map.cell_size
+                                break
+                        
+                        if best_frontier_node is None:
+                            print("[Relaxed Planning] No reachable frontiers even with force navigation.")
             
             # Fallback to legacy selection if Bayesian scoring is disabled or failed
             if best_frontier_node is None and not self.use_bayesian_frontier:

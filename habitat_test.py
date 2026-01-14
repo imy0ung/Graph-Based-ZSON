@@ -84,7 +84,7 @@ if __name__ == "__main__":
     
     # Multi-object navigation: list of objects to find
     #qs = ["A fridge", "A TV", "A toilet", "A Couch", "A bed"]
-    qs =["toilet"]
+    qs =["tv"]
     #qs =["bed"]
     mapper.set_query([qs[0]])  # Start with first object
     hm3d_path = "datasets/scene_datasets/hm3d"
@@ -193,7 +193,14 @@ if __name__ == "__main__":
             current_pos = np.array([[-state.position[2]], [-state.position[0]], [state.position[1]]])
             path = mapper.get_path()
             # rr.log("map/path", rr.LineStrips2D(path))
-            if path and len(path) > 1:
+            
+            # Handle Spin Recovery / Simple Actions
+            if isinstance(path, str):
+                if path == "L":
+                    action = "turn_left"
+                elif path == "R":
+                    action = "turn_right"
+            elif path is not None and len(path) > 1:
                 path = Planning.simplify_path(np.array(path))
                 path = path.astype(np.float32)
                 for i in range(path.shape[0]):
