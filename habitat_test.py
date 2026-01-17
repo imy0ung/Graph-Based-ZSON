@@ -90,10 +90,10 @@ if __name__ == "__main__":
     hm3d_path = "datasets/scene_datasets/hm3d"
 
     backend_cfg = habitat_sim.SimulatorConfiguration()
-    backend_cfg.scene_id = hm3d_path + "/val/00843-DYehNKdT76V/DYehNKdT76V.basis.glb"
+    #backend_cfg.scene_id = hm3d_path + "/val/00843-DYehNKdT76V/DYehNKdT76V.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00832-qyAac8rV8Zk/qyAac8rV8Zk.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00820-mL8ThkuaVTM/mL8ThkuaVTM.basis.glb"
-    #backend_cfg.scene_id = hm3d_path + "/val/00878-XB4GS9ShBRE/XB4GS9ShBRE.basis.glb"
+    backend_cfg.scene_id = hm3d_path + "/val/00878-XB4GS9ShBRE/XB4GS9ShBRE.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00876-mv2HUxq3B53/mv2HUxq3B53.basis.glb"
     #backend_cfg.scene_id = hm3d_path + "/val/00809-Qpor2mEya8F/Qpor2mEya8F.basis.glb"
     backend_cfg.scene_dataset_config_file = hm3d_path + "/hm3d_annotated_basis.scene_dataset_config.json"
