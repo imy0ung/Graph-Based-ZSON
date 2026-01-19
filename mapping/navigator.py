@@ -1,6 +1,13 @@
 """
 This module contains the Navigator class, which is responsible for the main functionality. It updates Onemap and uses it
 for navigation and exploration.
+
+Includes Bayesian frontier selection logic for Zero-Shot Object Navigation (ZSON):
+- Uses SigLIP2 for visual room classification P(R|F)
+- Uses spatial common-sense priors P(O|R) from p_object_room.csv
+- Computes Bayesian score: S(F) = Σ P(O_target|R_j) × P(R_j|F)
+- Implements Gateway Strategy for hall_stairwell transitions
+- Provides fallback logic for unreachable frontiers
 """
 import time
 
@@ -12,6 +19,7 @@ from mapping import (OneMap, PoseGraph, PoseNode, FrontierNode, detect_frontiers
 from planning import Planning
 from vision_models.base_model import BaseModel
 from vision_models.yolo_world_detector import YOLOWorldDetector
+from vision_models.bayesian_frontier_scorer import BayesianFrontierScorer, FrontierScore, ROOM_CATEGORIES
 from onemap_utils import monochannel_to_inferno_rgb, log_map_rerun
 from config import Conf, load_config
 from config import SpotControllerConf
@@ -37,6 +45,9 @@ import rerun as rr
 
 # cv2
 import cv2
+
+# PIL for image processing
+from PIL import Image
 
 
 def closest_point_within_threshold(nav_goals: List[NavGoal], target_point: np.ndarray, threshold: float) -> int:
@@ -126,9 +137,11 @@ class Navigator:
     last_nav_goal: Union[NavGoal, None]
 
     def __init__(self,
-                 model: BaseModel,
+                 model: Optional[BaseModel],
                  detector: YOLOWorldDetector,
-                 config: Conf
+                 config: Conf,
+                 use_bayesian_frontier: bool = True,
+                 prior_matrix_path: str = "p_object_room.csv",
                  ) -> None:
 
         self.cyclic_checker = CyclicChecker()
@@ -141,17 +154,44 @@ class Navigator:
         sam_model_t = "vit_t"
         sam_checkpoint = "weights/mobile_sam.pt"
         self.sam = sam_model_registry[sam_model_t](checkpoint=sam_checkpoint)
-        self.sam.to(device="cuda")
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.sam.to(device=device)
         self.sam.eval()
         self.sam_predictor = SamPredictor(self.sam)
+        
+        # Bayesian Frontier Scorer for ZSON
+        self.use_bayesian_frontier = use_bayesian_frontier
+        self.bayesian_scorer: Optional[BayesianFrontierScorer] = None
+        if use_bayesian_frontier:
+            try:
+                self.bayesian_scorer = BayesianFrontierScorer(
+                    prior_matrix_path=prior_matrix_path,
+                    lazy_load_siglip=True,  # Lazy load SigLIP2 model
+                )
+                print(f"[Navigator] Bayesian frontier scoring enabled with prior matrix: {prior_matrix_path}")
+            except Exception as e:
+                print(f"[Navigator] Failed to initialize Bayesian scorer: {e}")
+                print("[Navigator] Falling back to legacy frontier selection")
+                self.use_bayesian_frontier = False
 
-        self.one_map = OneMap(self.model.feature_dim, config.mapping, map_device="cpu")
+        # Initialize OneMap
+        # If model is None, we use a dummy feature dim of 1 (instead of 512)
+        # to minimize CPU overhead in OneMap, since we don't use these features anyway.
+        feature_dim = self.model.feature_dim if self.model is not None else 1
+        
+        # Detect device for OneMap
+        map_device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[Navigator] Initializing OneMap on device: {map_device}")
+        self.one_map = OneMap(feature_dim, config.mapping, map_device=map_device)
         
         # Initialize pose graph (in-memory for ddafce5-like behavior)
         self.pose_graph = PoseGraph(db_path=None, session_name=None)
 
         self.query_text = ["Other."]
-        self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        if self.model is not None:
+            self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        else:
+            self.query_text_features = None
 
         # Current frame image features for frontier embedding extraction
         self.current_image_features: Optional[torch.Tensor] = None
@@ -166,6 +206,14 @@ class Navigator:
 
         self.last_nav_goal = None
         self.last_frontier_node = None  # Track last frontier node for stuck detection
+        self.last_bayesian_frontier_id: Optional[int] = None  # For hysteresis bonus (anti-oscillation)
+        
+        # Goal Locking System (Anti-oscillation)
+        self.locked_frontier_node: Optional[FrontierNode] = None  # Currently locked goal
+        self.locked_frontier_score: float = 0.0  # Score of locked goal for comparison
+        self.goal_lock_steps: int = 0  # Steps since goal was locked
+        self.GOAL_LOCK_MIN_STEPS: int = 5  # Minimum steps before allowing goal change
+        
         self.last_pose = None
         self.saw_left = False
         self.saw_right = False
@@ -241,7 +289,10 @@ class Navigator:
 
     def reset(self):
         self.query_text = ["Other."]
-        self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        if self.model is not None:
+            self.query_text_features = self.model.get_text_features(self.query_text).to(self.one_map.map_device)
+        else:
+            self.query_text_features = None
         self.similar_points = None
         self.similar_scores = None
         self.object_detected = False
@@ -249,6 +300,13 @@ class Navigator:
         self.target_object_node = None  # Reset target object node tracking
         self.last_pose = None
         self.last_frontier_node = None  # Reset frontier node tracking
+        self.last_bayesian_frontier_id = None  # Reset hysteresis tracking
+        
+        # Reset goal locking system
+        self.locked_frontier_node = None
+        self.locked_frontier_score = 0.0
+        self.goal_lock_steps = 0
+        
         self.stuck_at_nav_goal_counter = 0
         self.stuck_at_cell_counter = 0
         self.is_goal_path = False
@@ -286,8 +344,11 @@ class Navigator:
         if txt != self.query_text:
             print(f"Setting query to {txt}")
             self.query_text = txt
-            self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(
-                self.one_map.map_device)
+            if self.model is not None:
+                self.query_text_features = self.model.get_text_features(["a " + self.query_text[0]]).to(
+                    self.one_map.map_device)
+            else:
+                self.query_text_features = None
             self.one_map.reset_checked_map()
             self.detector.set_classes(self.query_text)
             # Reset object detection state when query changes (for multi-object navigation)
@@ -303,67 +364,54 @@ class Navigator:
         mask_crop: Optional[np.ndarray] = None,
     ) -> Optional[float]:
         """
-        Verify that a detected label matches the image region using CLIP cosine similarity.
-        Uses SAM mask-based pooling when `mask_crop` is provided to reduce background influence.
+        Verify that a detected label matches the image region using SigLIP cosine similarity.
+        (Replaced CLIP with SigLIP2 for VRAM efficiency - uses same model as room classification)
         
         Args:
             image_crop: 탐지된 영역의 이미지 crop [H, W, C] (RGB)
             detected_label: YOLO가 탐지한 라벨
-            mask_crop: Optional boolean mask [H, W] aligned with `image_crop` (True for object pixels)
+            mask_crop: Optional boolean mask (unused in SigLIP version, kept for API compatibility)
         
         Returns:
-            CLIP cosine similarity score (roughly in [-1, 1]) or None if unavailable
+            SigLIP cosine similarity score (roughly in [-1, 1]) or None if unavailable
         """
+        # Use SigLIP2 from Bayesian scorer (VRAM efficient - single model)
+        if self.use_bayesian_frontier and self.bayesian_scorer is not None:
+            try:
+                return self.bayesian_scorer.siglip_classifier.compute_object_verification_score(
+                    image_crop=image_crop,
+                    detected_label=detected_label,
+                )
+            except Exception as e:
+                print(f"[SigLIP Verification] Error: {e}")
+                return None
+        
+        # Fallback to CLIP if Bayesian scorer not available
         try:
-            # 이미지 crop 전처리 (CLIP 모델 입력 형식으로)
-            # image_crop은 [H, W, C] 형식
             if image_crop.shape[0] < 10 or image_crop.shape[1] < 10:
-                # 너무 작은 crop은 신뢰할 수 없음
                 return None
             
             # [H, W, C] -> [C, H, W]로 변환
             image_for_clip = image_crop.transpose(2, 0, 1)
             
             # CLIP으로 텍스트 특징 추출 (단일 라벨)
+            if self.model is None:
+                return None
+                
             text_prompt = f"a {detected_label}"
             text_features = self.model.get_text_features([text_prompt])  # [1, F]
             
             # CLIP으로 이미지 특징 추출 (dense feature map)
             image_features = self.model.get_image_features(image_for_clip[np.newaxis, ...])  # [1, F, H', W']
-            
-            # Mask-based pooling in feature space (reduces background influence)
-            if mask_crop is not None and mask_crop.size > 0:
-                mask_bool = mask_crop.astype(bool)
-                if mask_bool.any():
-                    mask_t = torch.from_numpy(mask_bool.astype(np.float32))[None, None, ...]  # [1,1,H,W]
-                    mask_t = torch.nn.functional.interpolate(
-                        mask_t,
-                        size=(image_features.shape[2], image_features.shape[3]),
-                        mode="nearest",
-                    ).to(image_features.device)  # [1,1,Hf,Wf]
-                    weights = mask_t.squeeze(0).squeeze(0)  # [Hf,Wf]
-                    denom = weights.sum()
-                    if float(denom) > 1.0:
-                        pooled = (image_features[0] * weights.unsqueeze(0)).sum(dim=(1, 2)) / denom
-                        image_features_global = pooled.unsqueeze(0)
-                    else:
-                        image_features_global = image_features.mean(dim=(2, 3))
-                else:
-                    image_features_global = image_features.mean(dim=(2, 3))
-            else:
-                image_features_global = image_features.mean(dim=(2, 3))
-
+            image_features_global = image_features.mean(dim=(2, 3))
             image_features_global = torch.nn.functional.normalize(image_features_global, dim=1)
             
-            # Cosine similarity (since both are normalized)
+            # Cosine similarity
             similarity = torch.mm(image_features_global, text_features.t()).squeeze(0).squeeze(0)
             return float(similarity.detach().cpu().item())
             
         except Exception as e:
-            # 오류 발생 시 점수 미사용
-            print(f"[CLIP Verification] Error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"[CLIP Verification Fallback] Error: {e}")
             return None
 
     def find_target_object_in_graph(
@@ -372,11 +420,11 @@ class Navigator:
         robot_y: float,
         min_confidence: float = 0.8,
         min_observations: int = 1,
-        min_clip_score: float = 0.05,  # CLIP 검증 최소 점수
+        min_clip_score: float = 0.05,  # SigLIP 검증 최소 점수 (변수명 호환성 유지)
     ) -> Optional[Tuple[np.ndarray, Any]]:
         """
         PoseGraph에서 쿼리 텍스트에 매칭되는 가장 가까운 객체 검색.
-        CLIP 검증 점수가 임계값 이상인 객체만 고려.
+        SigLIP2 검증 점수가 임계값 이상인 객체만 고려.
         경로 계획이 가능한 객체만 반환.
         
         Args:
@@ -384,7 +432,7 @@ class Navigator:
             robot_y: 로봇 y 좌표 (metric)
             min_confidence: 최소 신뢰도 임계값 (기본값 0.5, 제거 임계값 0.8보다 낮게 설정)
             min_observations: 최소 관측 횟수 (노이즈 필터링)
-            min_clip_score: 최소 CLIP cosine similarity (이 값 미만은 오탐지로 간주)
+            min_clip_score: 최소 SigLIP2 cosine similarity (이 값 미만은 오탐지로 간주)
         
         Returns:
             (목표 픽셀 좌표 [px, py], ObjectNode) 또는 None
@@ -411,13 +459,13 @@ class Navigator:
         explored_mask = self.one_map.explored_area.astype(np.uint8)
         
         for target_obj, distance in candidates:
-            # CLIP 검증 점수 확인 (오탐지 필터링)
-            avg_clip = target_obj.avg_clip_score
+            # SigLIP2 검증 점수 확인 (오탐지 필터링)
+            avg_clip = target_obj.avg_clip_score  # 변수명 호환성 유지 (실제로는 SigLIP2 점수)
             if target_obj.clip_scores and avg_clip < min_clip_score:
-                # CLIP 점수가 너무 낮음 → 오탐지 가능성 높음
-                print(f"[CLIP Filter] Rejected '{target_obj.label}' at "
+                # SigLIP2 점수가 너무 낮음 → 오탐지 가능성 높음
+                print(f"[SigLIP Filter] Rejected '{target_obj.label}' at "
                       f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
-                      f"avg_clip={avg_clip:.3f} < {min_clip_score} (obs={target_obj.num_observations})")
+                      f"avg_siglip={avg_clip:.3f} < {min_clip_score} (obs={target_obj.num_observations})")
                 continue
             
             # 월드 좌표를 픽셀 좌표로 변환
@@ -438,11 +486,11 @@ class Navigator:
             )
             
             if test_path is not None and len(test_path) > 0:
-                # 경로 계획 성공 → CLIP 검증 정보와 함께 로그
+                # 경로 계획 성공 → SigLIP2 검증 정보와 함께 로그
                 if avg_clip > 0:
-                    print(f"[CLIP Verified] Selected '{target_obj.label}' at "
+                    print(f"[SigLIP Verified] Selected '{target_obj.label}' at "
                           f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
-                          f"avg_clip={avg_clip:.3f}, obs={target_obj.num_observations}")
+                          f"avg_siglip={avg_clip:.3f}, obs={target_obj.num_observations}")
                 return target_px, target_obj
         
         # 모든 객체에 대해 경로 계획 실패
@@ -495,132 +543,302 @@ class Navigator:
             self.is_goal_path = False
             self.path = None
             
-            # Compute similarity and path length for each FrontierNode (excluding blacklisted ones)
-            # 순위 기반 파레토 전략:
-            # - Semantic: CLIP similarity (높을수록 좋음)
-            # - Greedy: 경로 길이의 역수 (짧을수록 좋음)
-            all_candidates = []  # (frontier_node, sim_value, path_length, path)
+            # =====================================================================
+            # Bayesian Frontier Selection for ZSON
+            # Uses SigLIP2 visual room classification + spatial common-sense priors
+            # Score: S(F) = Σ P(O_target|R_j) × P(R_j|F) + Gateway Bonus
+            # =====================================================================
             
-            # 미리 탐색용 맵 준비 (경로 계산에 재사용)
-            explored_mask = self.one_map.explored_area.astype(np.uint8)
-            navigable_for_planning = self.one_map.navigable_map & explored_mask
-            
-            for frontier_node in frontier_nodes:
-                if frontier_node.coarse_embedding is None:
-                    continue  # Skip nodes without embedding
-                
-                # Check if this frontier is blacklisted
-                goal_world = frontier_node.position[:2]  # [x, y]
-                goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
-                goal_point_px = np.array([goal_px, goal_py])
-                
-                # Skip if blacklisted
-                if len(self.blacklisted_nav_goals) > 0 and np.any(
-                        np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
-                    continue
-                
-                # Compute path to frontier (A* 경로 계획)
-                candidate_path = Planning.compute_to_goal(
-                    start,
-                    navigable_for_planning,
-                    explored_mask,
-                    goal_point_px,
-                    self.obstcl_kernel_size,
-                    2
-                )
-                
-                # Skip if no path found
-                if candidate_path is None or len(candidate_path) == 0:
-                    continue
-                
-                # Compute actual path length (sum of segment lengths in pixels)
-                path_length_px = 0.0
-                for i in range(1, len(candidate_path)):
-                    segment = np.linalg.norm(
-                        np.array(candidate_path[i]) - np.array(candidate_path[i-1])
-                    )
-                    path_length_px += segment
-                
-                # Convert to metric (approximate using map resolution)
-                # path_length ≈ path_length_px * cell_size
-                path_length = path_length_px * self.one_map.cell_size
-                
-                # Convert embedding to torch tensor
-                embedding_tensor = torch.from_numpy(frontier_node.coarse_embedding).float()
-                # Reshape for similarity computation: [F] -> [1, F, 1, 1] for dense model compatibility
-                if len(embedding_tensor.shape) == 1:
-                    embedding_tensor = embedding_tensor.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-                else:
-                    embedding_tensor = embedding_tensor.unsqueeze(0)
-                
-                # Compute similarity
-                similarity = self.model.compute_similarity(
-                    embedding_tensor.to(self.query_text_features.device),
-                    self.query_text_features
-                )
-                
-                # Extract scalar similarity value
-                if similarity.numel() == 1:
-                    sim_value = similarity.item()
-                else:
-                    sim_value = similarity.mean().item()
-                
-                all_candidates.append((frontier_node, sim_value, path_length, candidate_path))
-            
-            # 순위 기반 파레토 전략 (A → A → D)
-            # - Semantic: CLIP similarity (높을수록 좋음)
-            # - Greedy: 1/path_length (경로가 짧을수록 좋음)
-            # - 각각 순위 매긴 후 합산 순위가 가장 낮은 frontier 선택
             best_frontier_node = None
             best_similarity = -float('inf')
             best_path_length = 0.0
             best_path = None
             selection_mode = "none"
+            best_bayesian_score: Optional[FrontierScore] = None
+            fallback_candidates: List[Tuple[FrontierNode, FrontierScore, Optional[List]]] = []
             
-            if len(all_candidates) == 0:
-                pass  # No candidates
-            elif len(all_candidates) == 1:
-                # 후보가 하나면 그것 선택
-                selection_mode = "single"
-                best_frontier_node = all_candidates[0][0]
-                best_similarity = all_candidates[0][1]
-                best_path_length = all_candidates[0][2]
-                best_path = all_candidates[0][3]
-            else:
-                # 순위 기반 파레토 선택
-                selection_mode = "pareto"
+            if self.use_bayesian_frontier and self.bayesian_scorer is not None:
+                # Use Bayesian frontier selection
+                selection_mode = "bayesian"
                 
-                # 점수 배열 생성
-                semantic_scores = np.array([c[1] for c in all_candidates])  # similarity
-                path_lengths = np.array([c[2] for c in all_candidates])  # 경로 길이
-                greedy_scores = 1.0 / (path_lengths + 1e-6)  # 경로 길이의 역수 (짧을수록 높음)
+                bayesian_results = self._compute_bayesian_frontier_scores(frontier_nodes, start)
                 
-                # 순위 매기기 (높은 점수 = 낮은 순위, 1이 가장 좋음)
-                semantic_ranks = rankdata(-semantic_scores, method='min')
-                greedy_ranks = rankdata(-greedy_scores, method='min')
-                
-                # 합산 순위
-                combined_ranks = semantic_ranks + greedy_ranks
-                
-                # 최소 합산 순위 선택 (동점 시 semantic 우선)
-                best_idx = np.argmin(combined_ranks)
-                best_frontier_node = all_candidates[best_idx][0]
-                best_similarity = all_candidates[best_idx][1]
-                best_path_length = all_candidates[best_idx][2]
-                best_path = all_candidates[best_idx][3]
-                best_semantic_rank = int(semantic_ranks[best_idx])
-                best_greedy_rank = int(greedy_ranks[best_idx])
-                best_combined_rank = int(combined_ranks[best_idx])
+                if len(bayesian_results) > 0:
+                    # =============================================================
+                    # GOAL LOCKING SYSTEM (Anti-oscillation)
+                    # Once a goal is locked, only switch if:
+                    # 1. Locked goal is no longer reachable
+                    # 2. New goal's score exceeds locked by GOAL_LOCK_MARGIN
+                    # 3. Minimum lock steps have passed
+                    # =============================================================
+                    
+                    self.goal_lock_steps += 1
+                    
+                    # Check if locked frontier is still valid
+                    locked_still_valid = False
+                    locked_frontier_in_results: Optional[Tuple[FrontierNode, FrontierScore, Optional[List]]] = None
+                    
+                    if self.locked_frontier_node is not None:
+                        for frontier_node, score, path in bayesian_results:
+                            if frontier_node.id == self.locked_frontier_node.id:
+                                if score.is_reachable and path is not None:
+                                    locked_still_valid = True
+                                    locked_frontier_in_results = (frontier_node, score, path)
+                                    # Update locked score
+                                    self.locked_frontier_score = score.total_score
+                                break
+                    
+                    # Find the best new candidate
+                    new_best_node = None
+                    new_best_score: Optional[FrontierScore] = None
+                    new_best_path = None
+                    
+                    for frontier_node, score, path in bayesian_results:
+                        if score.is_reachable:
+                            new_best_node = frontier_node
+                            new_best_score = score
+                            new_best_path = path
+                            break  # Already sorted by score
+                    
+                    # Decision logic for goal locking
+                    should_switch_goal = False
+                    switch_reason = ""
+                    
+                    if self.locked_frontier_node is None:
+                        # No locked goal - lock the best one
+                        should_switch_goal = True
+                        switch_reason = "initial_lock"
+                    elif not locked_still_valid:
+                        # Locked goal is no longer reachable - switch
+                        should_switch_goal = True
+                        switch_reason = "locked_unreachable"
+                    elif new_best_score is not None and new_best_node is not None:
+                        # Check if new goal significantly exceeds locked goal
+                        score_margin = new_best_score.total_score - self.locked_frontier_score
+                        
+                        if (self.goal_lock_steps >= self.GOAL_LOCK_MIN_STEPS and 
+                            score_margin > self.bayesian_scorer.GOAL_LOCK_MARGIN):
+                            should_switch_goal = True
+                            switch_reason = f"margin_exceeded({score_margin:.3f}>{self.bayesian_scorer.GOAL_LOCK_MARGIN})"
+                    
+                    # Apply decision
+                    if should_switch_goal and new_best_node is not None and new_best_score is not None:
+                        best_frontier_node = new_best_node
+                        best_bayesian_score = new_best_score
+                        best_path = new_best_path
+                        best_similarity = new_best_score.bayesian_score
+                        
+                        # Lock the new goal
+                        self.locked_frontier_node = new_best_node
+                        self.locked_frontier_score = new_best_score.total_score
+                        self.goal_lock_steps = 0
+                        
+                        print(f"[Goal Lock] Switched goal: {switch_reason}")
+                        
+                        # Collect fallback candidates
+                        for frontier_node, score, path in bayesian_results:
+                            if frontier_node.id != new_best_node.id and score.is_reachable:
+                                fallback_candidates.append((frontier_node, score, path))
+                    
+                    elif locked_still_valid and locked_frontier_in_results is not None:
+                        # Keep the locked goal
+                        frontier_node, score, path = locked_frontier_in_results
+                        best_frontier_node = frontier_node
+                        best_bayesian_score = score
+                        best_path = path
+                        best_similarity = score.bayesian_score
+                        
+                        print(f"[Goal Lock] Maintaining locked goal (steps={self.goal_lock_steps})")
+                        
+                        # Collect fallback candidates
+                        for fn, sc, pa in bayesian_results:
+                            if fn.id != frontier_node.id and sc.is_reachable:
+                                fallback_candidates.append((fn, sc, pa))
+                    
+                    else:
+                        # Fallback: no locked goal and no new goal
+                        for frontier_node, score, path in bayesian_results:
+                            if score.is_reachable:
+                                if best_frontier_node is None:
+                                    best_frontier_node = frontier_node
+                                    best_bayesian_score = score
+                                    best_path = path
+                                    best_similarity = score.bayesian_score
+                                else:
+                                    fallback_candidates.append((frontier_node, score, path))
+                    
+                    # Compute path length for logging
+                    if best_path is not None:
+                        path_length_px = 0.0
+                        for i in range(1, len(best_path)):
+                            segment = np.linalg.norm(
+                                np.array(best_path[i]) - np.array(best_path[i-1])
+                            )
+                            path_length_px += segment
+                        best_path_length = path_length_px * self.one_map.cell_size
+                    
+                    # Debug output for Bayesian scores
+                    if self.bayesian_scorer is not None:
+                        all_scores = [score for _, score, _ in bayesian_results]
+                        target_obj = self.query_text[0] if self.query_text else "unknown"
+                        self.bayesian_scorer.debug_print_scores(all_scores, target_obj)
+                    
+                    # =============================================================
+                    # RELAXED PATH PLANNING (Force Navigation)
+                    # When all frontiers are unreachable, ignore unexplored areas
+                    # and plan paths through them (obstacles still respected)
+                    # =============================================================
+                    if best_frontier_node is None:
+                        print("[Relaxed Planning] All frontiers unreachable. "
+                              "Attempting force navigation (ignoring unexplored areas)...")
+                        
+                        # Force feasible mask: all areas are valid (ignore unexplored)
+                        force_feasible = np.ones_like(self.one_map.explored_area, dtype=np.uint8)
+                        
+                        # Re-score frontiers with relaxed planning (sorted by Bayesian score, highest first)
+                        for frontier_node, score, _ in bayesian_results:
+                            goal_world = frontier_node.position[:2]
+                            goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+                            goal_point_px = np.array([goal_px, goal_py])
+                            
+                            # Skip blacklisted
+                            if len(self.blacklisted_nav_goals) > 0 and np.any(
+                                    np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
+                                continue
+                            
+                            # Force path planning: navigable_map only (obstacles respected, unexplored ignored)
+                            force_path = Planning.compute_to_goal(
+                                start,
+                                self.one_map.navigable_map,  # Only obstacle avoidance
+                                force_feasible,               # Ignore unexplored areas
+                                goal_point_px,
+                                self.obstcl_kernel_size,
+                                self.min_goal_dist
+                            )
+                            
+                            if force_path is not None and len(force_path) > 0:
+                                best_frontier_node = frontier_node
+                                best_bayesian_score = score
+                                best_path = force_path
+                                best_similarity = score.bayesian_score
+                                
+                                # Update score to mark as reachable via relaxed planning
+                                score.is_reachable = True
+                                
+                                print(f"[Relaxed Planning] Found path to frontier at "
+                                      f"({goal_world[0]:.2f}, {goal_world[1]:.2f}) "
+                                      f"with score {score.total_score:.4f} (room: {score.top_room})")
+                                
+                                # Compute path length
+                                path_length_px = 0.0
+                                for i in range(1, len(force_path)):
+                                    segment = np.linalg.norm(
+                                        np.array(force_path[i]) - np.array(force_path[i-1])
+                                    )
+                                    path_length_px += segment
+                                best_path_length = path_length_px * self.one_map.cell_size
+                                break
+                        
+                        if best_frontier_node is None:
+                            print("[Relaxed Planning] No reachable frontiers even with force navigation.")
             
-            # 항상 터미널에 출력 (디버깅용)
+            # Fallback to legacy selection if Bayesian scoring is disabled or failed
+            if best_frontier_node is None and not self.use_bayesian_frontier:
+                # Legacy: Rank-based Pareto strategy using CLIP similarity
+                selection_mode = "pareto_legacy"
+                all_candidates = []  # (frontier_node, sim_value, path_length, path)
+                
+                explored_mask = self.one_map.explored_area.astype(np.uint8)
+                navigable_for_planning = self.one_map.navigable_map & explored_mask
+                
+                for frontier_node in frontier_nodes:
+                    if frontier_node.coarse_embedding is None:
+                        continue
+                    
+                    goal_world = frontier_node.position[:2]
+                    goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+                    goal_point_px = np.array([goal_px, goal_py])
+                    
+                    if len(self.blacklisted_nav_goals) > 0 and np.any(
+                            np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
+                        continue
+                    
+                    candidate_path = Planning.compute_to_goal(
+                        start,
+                        navigable_for_planning,
+                        explored_mask,
+                        goal_point_px,
+                        self.obstcl_kernel_size,
+                        2
+                    )
+                    
+                    if candidate_path is None or len(candidate_path) == 0:
+                        continue
+                    
+                    path_length_px = 0.0
+                    for i in range(1, len(candidate_path)):
+                        segment = np.linalg.norm(
+                            np.array(candidate_path[i]) - np.array(candidate_path[i-1])
+                        )
+                        path_length_px += segment
+                    
+                    path_length = path_length_px * self.one_map.cell_size
+                    
+                    embedding_tensor = torch.from_numpy(frontier_node.coarse_embedding).float()
+                    if len(embedding_tensor.shape) == 1:
+                        embedding_tensor = embedding_tensor.unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
+                    else:
+                        embedding_tensor = embedding_tensor.unsqueeze(0)
+                    
+                    if self.model is not None and self.query_text_features is not None:
+                        similarity = self.model.compute_similarity(
+                            embedding_tensor.to(self.query_text_features.device),
+                            self.query_text_features
+                        )
+                    else:
+                        # Fallback if model is missing (shouldn't happen in legacy mode if we want it to work, 
+                        # but safe to return 0)
+                        similarity = torch.tensor([0.0])
+                    
+                    if similarity.numel() == 1:
+                        sim_value = similarity.item()
+                    else:
+                        sim_value = similarity.mean().item()
+                    
+                    all_candidates.append((frontier_node, sim_value, path_length, candidate_path))
+                
+                if len(all_candidates) == 1:
+                    best_frontier_node = all_candidates[0][0]
+                    best_similarity = all_candidates[0][1]
+                    best_path_length = all_candidates[0][2]
+                    best_path = all_candidates[0][3]
+                elif len(all_candidates) > 1:
+                    semantic_scores = np.array([c[1] for c in all_candidates])
+                    path_lengths = np.array([c[2] for c in all_candidates])
+                    greedy_scores = 1.0 / (path_lengths + 1e-6)
+                    
+                    semantic_ranks = rankdata(-semantic_scores, method='min')
+                    greedy_ranks = rankdata(-greedy_scores, method='min')
+                    combined_ranks = semantic_ranks + greedy_ranks
+                    
+                    best_idx = np.argmin(combined_ranks)
+                    best_frontier_node = all_candidates[best_idx][0]
+                    best_similarity = all_candidates[best_idx][1]
+                    best_path_length = all_candidates[best_idx][2]
+                    best_path = all_candidates[best_idx][3]
+            
+            # Log frontier selection result
             if best_frontier_node is not None:
-                if len(all_candidates) >= 2:
-                    log_msg = (f"[Frontier Selection] Mode: {selection_mode}, Candidates: {len(all_candidates)}, "
-                               f"SemanticRank: {best_semantic_rank}, GreedyRank: {best_greedy_rank}, "
-                               f"CombinedRank: {best_combined_rank}, "
-                               f"Sim: {best_similarity:.3f}, PathLen: {best_path_length:.2f}m")
+                if selection_mode == "bayesian" and best_bayesian_score is not None:
+                    gateway_str = f", gateway_bonus={best_bayesian_score.gateway_bonus:.4f}" if best_bayesian_score.gateway_bonus > 0 else ""
+                    log_msg = (f"[Bayesian Frontier Selection] "
+                               f"Score={best_bayesian_score.total_score:.4f} "
+                               f"(bayes={best_bayesian_score.bayesian_score:.4f}{gateway_str}) | "
+                               f"TopRoom={best_bayesian_score.top_room}({best_bayesian_score.top_room_prob:.2f}) | "
+                               f"PathLen={best_path_length:.2f}m | "
+                               f"Fallbacks={len(fallback_candidates)}")
                 else:
-                    log_msg = f"[Frontier Selection] Mode: {selection_mode}, Candidates: {len(all_candidates)}, PathLen: {best_path_length:.2f}m"
+                    log_msg = f"[Frontier Selection] Mode: {selection_mode}, Sim: {best_similarity:.3f}, PathLen: {best_path_length:.2f}m"
                 
                 print(log_msg)
                 
@@ -637,8 +855,11 @@ class Navigator:
                 
                 if self.path:
                     if self.log:
+                        score_info = ""
+                        if best_bayesian_score is not None:
+                            score_info = f" (Bayesian score: {best_bayesian_score.total_score:.4f}, room: {best_bayesian_score.top_room})"
                         rr.log("path_updates", rr.TextLog(
-                            f"Selected frontier node with similarity {best_similarity:.3f} at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                            f"Selected frontier node{score_info} at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
                         ))
                         # 경로 좌표를 [y, x]에서 [x, y]로 스왑
                         path_swapped = np.array(self.path)[:, [1, 0]]
@@ -666,10 +887,11 @@ class Navigator:
                             if (self.last_frontier_node is None or 
                                 self.last_frontier_node.id != best_frontier_node.id):
                                 self.stuck_at_nav_goal_counter = 0
-                    # Update last frontier node
+                    # Update last frontier node (for stuck detection and hysteresis)
                     self.last_frontier_node = best_frontier_node
+                    self.last_bayesian_frontier_id = best_frontier_node.id  # For anti-oscillation hysteresis
                     
-                    # If stuck for too long, blacklist this frontier
+                    # If stuck for too long, blacklist this frontier and use fallback
                     if self.stuck_at_nav_goal_counter > 10:
                         # Blacklist this frontier
                         self.blacklisted_nav_goals.append(goal_point)
@@ -681,24 +903,75 @@ class Navigator:
                             del self.frontier_node_map[frontier_key]
                         # Mark as explored to prevent re-selection
                         best_frontier_node.is_explored = True
-                        if self.log:
-                            rr.log("path_updates", rr.TextLog(
-                                f"Frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) blacklisted due to stuck state."
-                            ))
-                        # Clear path and try again
-                        self.path = None
-                        self.stuck_at_nav_goal_counter = 0
-                        # Recursively try to find another frontier
-                        if len(frontier_nodes) > 1:
-                            self.compute_best_path(start)
-                            return
+                        
+                        blacklist_msg = f"Frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}) blacklisted due to stuck state."
+                        
+                        # Release goal lock when blacklisted
+                        if self.locked_frontier_node is not None and self.locked_frontier_node.id == best_frontier_node.id:
+                            self.locked_frontier_node = None
+                            self.locked_frontier_score = 0.0
+                            self.goal_lock_steps = 0
+                            print("[Goal Lock] Released due to blacklist")
+                        
+                        # =====================================================
+                        # Fallback Logic: Select next-best frontier
+                        # =====================================================
+                        if len(fallback_candidates) > 0:
+                            # Use pre-computed fallback candidate
+                            fallback_node, fallback_score, fallback_path = fallback_candidates[0]
+                            fallback_candidates = fallback_candidates[1:]  # Remove used fallback
+                            
+                            self.path = fallback_path
+                            best_frontier_node = fallback_node
+                            best_bayesian_score = fallback_score
+                            
+                            fallback_world = fallback_node.position[:2]
+                            fallback_msg = (f"Fallback to frontier at ({fallback_world[0]:.2f}, {fallback_world[1]:.2f}) "
+                                          f"with score {fallback_score.total_score:.4f}")
+                            print(f"[Fallback] {fallback_msg}")
+                            
+                            if self.log:
+                                rr.log("path_updates", rr.TextLog(f"{blacklist_msg} {fallback_msg}"))
+                            
+                            self.stuck_at_nav_goal_counter = 0
+                            self.last_frontier_node = fallback_node
+                        else:
+                            if self.log:
+                                rr.log("path_updates", rr.TextLog(blacklist_msg))
+                            # Clear path and try again
+                            self.path = None
+                            self.stuck_at_nav_goal_counter = 0
+                            # Recursively try to find another frontier
+                            if len(frontier_nodes) > 1:
+                                self.compute_best_path(start)
+                                return
                 else:
-                    # No path found - DON'T immediately blacklist, just try another frontier
-                    # Only blacklist after repeated failures (handled by stuck_at_nav_goal_counter)
+                    # No path found - use fallback if available
+                    no_path_msg = f"No path found to frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f})"
+                    
+                    # =====================================================
+                    # Fallback Logic: Select next-best frontier when unreachable
+                    # =====================================================
+                    if len(fallback_candidates) > 0:
+                        fallback_node, fallback_score, fallback_path = fallback_candidates[0]
+                        
+                        if fallback_path is not None and len(fallback_path) > 0:
+                            self.path = fallback_path
+                            best_frontier_node = fallback_node
+                            best_bayesian_score = fallback_score
+                            
+                            fallback_world = fallback_node.position[:2]
+                            print(f"[Fallback] {no_path_msg}, using fallback at ({fallback_world[0]:.2f}, {fallback_world[1]:.2f})")
+                            
+                            if self.log:
+                                rr.log("path_updates", rr.TextLog(
+                                    f"{no_path_msg}, fallback to ({fallback_world[0]:.2f}, {fallback_world[1]:.2f}) "
+                                    f"score={fallback_score.total_score:.4f}"
+                                ))
+                            return
+                    
                     if self.log:
-                        rr.log("path_updates", rr.TextLog(
-                            f"No path found to frontier at ({goal_world[0]:.2f}, {goal_world[1]:.2f}), trying another."
-                        ))
+                        rr.log("path_updates", rr.TextLog(f"{no_path_msg}, trying another."))
                     # Try to find another frontier without blacklisting
                     if len(frontier_nodes) > 1:
                         # Temporarily mark as explored to skip in this iteration
@@ -1176,8 +1449,8 @@ class Navigator:
                                 position_w = np.array([x_world_final, y_world_final, 0.0])
 
                     if position_w is not None:
-                        # CLIP 검증 점수 계산 (탐지된 라벨이 실제로 맞는지)
-                        clip_score = None
+                        # SigLIP2 검증 점수 계산 (탐지된 라벨이 실제로 맞는지)
+                        clip_score = None  # 변수명 호환성 유지 (실제로는 SigLIP2 점수)
                         try:
                             x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
                             # Clamp to image bounds
@@ -1200,19 +1473,19 @@ class Navigator:
                                 # 디버그 출력 (매 100 스텝마다)
                                 if self.pose_graph._step_counter % 100 == 0:
                                     if clip_score is None:
-                                        print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP=None")
+                                        print(f"[SigLIP Verify] {class_name}: YOLO={score:.2f}, SigLIP=None")
                                     else:
-                                        print(f"[CLIP Verify] {class_name}: YOLO={score:.2f}, CLIP_cos={clip_score:.3f}")
+                                        print(f"[SigLIP Verify] {class_name}: YOLO={score:.2f}, SigLIP_cos={clip_score:.3f}")
                         except Exception as e:
                             if self.pose_graph._step_counter % 100 == 0:
-                                print(f"[CLIP Verify] Error for {class_name}: {e}")
+                                print(f"[SigLIP Verify] Error for {class_name}: {e}")
                         
                         observations.append({
                             "label": class_name,
                             "position_w": position_w,
                             "confidence": float(score),
                             "embedding": None,
-                            "clip_score": clip_score,  # CLIP 검증 점수 추가
+                            "clip_score": clip_score,  # SigLIP2 검증 점수 (변수명 호환성 유지)
                         })
                 
                 # Process all observations in batch
@@ -1231,7 +1504,14 @@ class Navigator:
                         mahalanobis_threshold=3.0,
                     )
         a = time.time()
-        image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        if self.model is not None:
+            image_features = self.model.get_image_features(image[np.newaxis, ...]).squeeze(0)
+        else:
+            # Dummy features if CLIP is not available
+            # OneMap expects features to update the map, but we only care about obstacles
+            # Create a zero tensor of shape (feature_dim, 2, 2) to satisfy OneMap.update expecting >1x1 tensor
+            # (feature_dim, H, W). feature_dim is now 1 for optimization.
+            image_features = torch.zeros((self.one_map.feature_dim, 2, 2), device=self.one_map.map_device, dtype=torch.float32)
         b = time.time()
         
         # Store current frame data for frontier embedding extraction
@@ -1624,6 +1904,293 @@ class Navigator:
         center_world = np.array([np.mean(x_world), np.mean(y_world), 0.0], dtype=np.float32)
         center_pixel = np.array([np.mean(pixel_x), np.mean(pixel_y)], dtype=np.float32)
         return center_world, center_pixel
+
+    def _extract_frontier_observation_image(
+        self,
+        frontier_world_pos: np.ndarray,
+        crop_size: int = 224,
+    ) -> Optional[np.ndarray]:
+        """
+        Extract a crop of the current camera image centered on the frontier's projected location.
+        
+        This simulates what the agent would see when looking at the frontier direction.
+        Uses the current frame's RGB image and projects the frontier world position
+        to pixel coordinates.
+        
+        Args:
+            frontier_world_pos: Frontier position in world coordinates [x, y, z]
+            crop_size: Size of the output image (default 224 for SigLIP2)
+            
+        Returns:
+            RGB image crop [H, W, C] as numpy array, or None if projection fails
+        """
+        if self.current_image is None or self.current_depth is None or self.current_odometry is None:
+            return None
+        
+        # Get current pose for projection
+        current_pose_id = self.pose_graph.pose_ids[-1] if self.pose_graph.pose_ids else None
+        if current_pose_id is None:
+            return None
+        
+        current_pose = self.pose_graph.nodes[current_pose_id]
+        if not isinstance(current_pose, PoseNode):
+            return None
+        
+        yaw = current_pose.theta
+        
+        # Project frontier to camera pixel coordinates
+        pixel_coords = self._world_to_camera_pixel(
+            frontier_world_pos,
+            self.current_depth,
+            yaw,
+            self.current_odometry
+        )
+        
+        if pixel_coords is None:
+            # Frontier not visible in current frame - use full image
+            # This is a fallback for frontiers behind the camera
+            image_hwc = self.current_image.transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
+            # Resize to crop_size
+            pil_img = Image.fromarray(image_hwc.astype(np.uint8))
+            pil_img = pil_img.resize((crop_size, crop_size), Image.BILINEAR)
+            return np.array(pil_img)
+        
+        pixel_x, pixel_y = pixel_coords
+        
+        # Extract crop centered on frontier projection
+        image_hwc = self.current_image.transpose(1, 2, 0)  # [C, H, W] -> [H, W, C]
+        h, w = image_hwc.shape[:2]
+        
+        # Calculate crop region
+        half_crop = crop_size // 2
+        x1 = max(0, pixel_x - half_crop)
+        x2 = min(w, pixel_x + half_crop)
+        y1 = max(0, pixel_y - half_crop)
+        y2 = min(h, pixel_y + half_crop)
+        
+        # If crop is too small, expand to full image
+        if (x2 - x1) < crop_size // 2 or (y2 - y1) < crop_size // 2:
+            # Use full image as fallback
+            pil_img = Image.fromarray(image_hwc.astype(np.uint8))
+            pil_img = pil_img.resize((crop_size, crop_size), Image.BILINEAR)
+            return np.array(pil_img)
+        
+        # Extract and resize crop
+        crop = image_hwc[y1:y2, x1:x2]
+        pil_crop = Image.fromarray(crop.astype(np.uint8))
+        pil_crop = pil_crop.resize((crop_size, crop_size), Image.BILINEAR)
+        
+        return np.array(pil_crop)
+
+    def _compute_bayesian_frontier_scores(
+        self,
+        frontier_nodes: List[FrontierNode],
+        start: np.ndarray,
+    ) -> List[Tuple[FrontierNode, FrontierScore, Optional[List]]]:
+        """
+        Compute Bayesian scores for all frontier nodes using SigLIP2 room classification.
+        
+        Includes anti-oscillation features:
+        - Distance penalty: closer frontiers are preferred
+        - Hysteresis bonus: previous target gets a bonus to reduce goal switching
+        
+        Args:
+            frontier_nodes: List of FrontierNode objects from pose graph
+            start: Current robot position in pixel coordinates [px, py]
+            
+        Returns:
+            List of tuples (frontier_node, frontier_score, path) sorted by total_score descending
+        """
+        if not self.use_bayesian_frontier or self.bayesian_scorer is None:
+            return []
+        
+        target_object = self.query_text[0] if self.query_text else "chair"
+        
+        # Prepare maps for path planning
+        explored_mask = self.one_map.explored_area.astype(np.uint8)
+        navigable_for_planning = self.one_map.navigable_map & explored_mask
+        
+        results = []
+        frontier_images = []
+        frontier_paths = []
+        reachability = []
+        path_distances_meters = []  # For distance penalty
+        frontier_node_ids = []  # For hysteresis matching
+        
+        # Track which frontiers need computation vs cached
+        frontiers_to_compute_indices = []  # Indices in results list that need computation
+        cached_room_probs = []  # Store cached probs, None for those needing computation
+        
+        for frontier_node in frontier_nodes:
+            if frontier_node.coarse_embedding is None and self.current_image is None:
+                continue
+            
+            # Check blacklist
+            goal_world = frontier_node.position[:2]
+            goal_px, goal_py = self.one_map.metric_to_px(goal_world[0], goal_world[1])
+            goal_point_px = np.array([goal_px, goal_py])
+            
+            if len(self.blacklisted_nav_goals) > 0 and np.any(
+                    np.all(goal_point_px == self.blacklisted_nav_goals, axis=1)):
+                continue
+            
+            # Compute path to frontier
+            candidate_path = Planning.compute_to_goal(
+                start,
+                navigable_for_planning,
+                explored_mask,
+                goal_point_px,
+                self.obstcl_kernel_size,
+                2
+            )
+            
+            is_reachable = candidate_path is not None and len(candidate_path) > 0
+            frontier_paths.append(candidate_path if is_reachable else None)
+            reachability.append(is_reachable)
+            
+            # Compute path distance in meters (for distance penalty)
+            if is_reachable and candidate_path is not None:
+                path_length_px = 0.0
+                for i in range(1, len(candidate_path)):
+                    segment = np.linalg.norm(
+                        np.array(candidate_path[i]) - np.array(candidate_path[i-1])
+                    )
+                    path_length_px += segment
+                path_distance_m = path_length_px * self.one_map.cell_size
+            else:
+                path_distance_m = 0.0
+            path_distances_meters.append(path_distance_m)
+            
+            # Track frontier node ID for hysteresis
+            frontier_node_ids.append(frontier_node.id)
+            
+            # Check if we have cached room probabilities
+            if frontier_node.room_probs is not None:
+                # Use cached probability
+                cached_room_probs.append(frontier_node.room_probs)
+                results.append((frontier_node, goal_point_px, candidate_path, is_reachable))
+                continue
+            
+            # No cache - prepare for computation
+            cached_room_probs.append(None)  # Placeholder
+            frontiers_to_compute_indices.append(len(results))
+            
+            # Extract frontier observation image for SigLIP2
+            frontier_img = self._extract_frontier_observation_image(
+                frontier_node.position,
+                crop_size=224
+            )
+            
+            if frontier_img is None:
+                # Fallback: use current full image
+                if self.current_image is not None:
+                    image_hwc = self.current_image.transpose(1, 2, 0)
+                    pil_img = Image.fromarray(image_hwc.astype(np.uint8))
+                    pil_img = pil_img.resize((224, 224), Image.BILINEAR)
+                    frontier_img = np.array(pil_img)
+                else:
+                    # Skip this frontier (remove from tracking lists)
+                    frontier_paths.pop()
+                    reachability.pop()
+                    path_distances_meters.pop()
+                    frontier_node_ids.pop()
+                    cached_room_probs.pop()
+                    frontiers_to_compute_indices.pop()
+                    continue
+            
+            frontier_images.append(frontier_img)
+            results.append((frontier_node, goal_point_px, candidate_path, is_reachable))
+        
+        if len(results) == 0:
+            return []
+            
+        # Batch compute room probabilities for new frontiers
+        if len(frontier_images) > 0:
+            new_room_probs = self.bayesian_scorer.siglip_classifier.classify_batch(frontier_images)
+            
+            # Fill in computed probabilities and update cache
+            for i, idx in enumerate(frontiers_to_compute_indices):
+                probs = new_room_probs[i]
+                cached_room_probs[idx] = probs
+                # Update FrontierNode cache
+                results[idx][0].room_probs = probs
+                
+        # Verify all probabilities are available
+        final_room_probs = []
+        for probs in cached_room_probs:
+            if probs is None:
+                # Should not happen if logic is correct
+                print("[BayesianScorer] Warning: Missing room probabilities after computation")
+                final_room_probs.append(np.ones(10) / 10.0) # Uniform fallback
+            else:
+                final_room_probs.append(probs)
+        
+        # Find previous target index for hysteresis bonus
+        previous_target_idx = None
+        if self.last_bayesian_frontier_id is not None:
+            for idx, node_id in enumerate(frontier_node_ids):
+                if node_id == self.last_bayesian_frontier_id:
+                    previous_target_idx = idx
+                    break
+        
+        # We need to manually construct FrontierScore objects because score_frontiers_batch 
+        # expects images and re-computes probabilities.
+        # Instead, we'll use a modified approach or manually score each.
+        # Since we already have room_probs, we can use score_frontier logic directly or 
+        # create a new method in scorer that accepts pre-computed probs.
+        # For now, let's implement the scoring logic here using the scorer's helper methods
+        # to avoid modifying the scorer interface too much, or we can just reconstruct the scores.
+        
+        object_prior = self.bayesian_scorer.get_object_prior(target_object)
+        frontier_scores = []
+        
+        for i, (room_probs, is_reachable, path_dist) in enumerate(
+            zip(final_room_probs, reachability, path_distances_meters)
+        ):
+            # Compute Bayesian score
+            bayesian_score = float(np.sum(object_prior * room_probs))
+            
+            # Compute Gateway bonus
+            top_room_idx = np.argmax(room_probs)
+            if top_room_idx == self.bayesian_scorer.HALL_STAIRWELL_IDX:
+                target_room_idx = np.argmax(object_prior)
+                gateway_bonus = float(self.bayesian_scorer.GATEWAY_ALPHA * object_prior[target_room_idx])
+            else:
+                gateway_bonus = 0.0
+            
+            # Compute distance penalty (Anti-oscillation)
+            distance_penalty = self.bayesian_scorer.DISTANCE_PENALTY_COEFF * path_dist
+            
+            # Compute hysteresis bonus (Anti-oscillation)
+            is_previous_target = (previous_target_idx is not None and i == previous_target_idx)
+            hysteresis_bonus = self.bayesian_scorer.HYSTERESIS_BONUS if is_previous_target else 0.0
+            
+            # Total score with anti-oscillation adjustments
+            total_score = bayesian_score + gateway_bonus - distance_penalty + hysteresis_bonus
+            
+            frontier_scores.append(FrontierScore(
+                frontier_id=i,
+                bayesian_score=bayesian_score,
+                room_probs=room_probs,
+                top_room=ROOM_CATEGORIES[top_room_idx],
+                top_room_prob=float(room_probs[top_room_idx]),
+                gateway_bonus=gateway_bonus,
+                distance_penalty=distance_penalty,
+                hysteresis_bonus=hysteresis_bonus,
+                total_score=total_score,
+                is_reachable=is_reachable,
+            ))
+        
+        # Combine results
+        scored_results = []
+        for i, (frontier_node, goal_px, path, is_reachable) in enumerate(results):
+            score = frontier_scores[i]
+            scored_results.append((frontier_node, score, path))
+        
+        # Sort by total score (descending)
+        scored_results.sort(key=lambda x: x[1].total_score, reverse=True)
+        
+        return scored_results
 
     def export_pose_graph(self, filepath: str) -> None:
         """Export pose graph to file."""

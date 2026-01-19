@@ -193,6 +193,7 @@ class FrontierNode(BaseNode):
     coarse_embedding: Optional[np.ndarray] = None  # local visual context 요약
     semantic_hint: Optional[str] = None            # optional LLM hint (e.g. "kitchen-like area")
     is_explored: bool = False                      # 탐색 완료 여부
+    room_probs: Optional[np.ndarray] = None        # SigLIP2 room probabilities (cached)
 
 
 @dataclass
