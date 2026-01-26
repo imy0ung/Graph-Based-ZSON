@@ -53,14 +53,14 @@ class BayesianFrontierScorer:
     TARGET_OBJECTS = ["chair", "bed", "plant", "toilet", "sofa", "tv_monitor"]
     
     # Gateway strategy parameters
-    GATEWAY_ALPHA = 0.3  # Transition weight for hall_stairwell bonus
+    GATEWAY_ALPHA = 0.25  # Transition weight for hall_stairwell bonus
     HALL_STAIRWELL_IDX = ROOM_CATEGORIES.index("hall_stairwell")
     
     # Anti-oscillation parameters
     DISTANCE_PENALTY_COEFF = 0.02  # Penalty per meter of path distance
     HYSTERESIS_BONUS = 0.10  # Increased bonus for maintaining previous goal
     GOAL_LOCK_MARGIN = 0.15  # New goal must exceed current by this margin to switch
-    
+    # 0.15 -> 0.0
     def __init__(
         self,
         prior_matrix_path: str = "p_object_room.csv",
