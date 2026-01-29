@@ -54,6 +54,8 @@ class SigLIP2RoomClassifier:
     
     # List of models to try in order of preference (smaller models first for memory efficiency)
     MODEL_CANDIDATES = [
+        "google/siglip2-large-patch16-256",
+        "google/siglip-large-patch1"
         "google/siglip-base-patch16-224",    # Base model (~400MB, memory efficient)
         "google/siglip-base-patch16-256",    # Medium quality
         "openai/clip-vit-base-patch32",      # Fallback to CLIP (~600MB)
@@ -106,6 +108,37 @@ class SigLIP2RoomClassifier:
         self._precompute_text_embeddings()
         
         print(f"[SigLIP] Model loaded successfully. Text embeddings cached for {len(ROOM_CATEGORIES)} room types.")
+    
+    @property
+    def image_size(self) -> int:
+        """
+        Get the expected input image size for the loaded model.
+        
+        Returns:
+            int: Expected image size (e.g., 224, 256)
+        """
+        if self.processor is None:
+            return 224  # Default fallback
+        
+        # Try to get size from processor
+        if hasattr(self.processor, 'size'):
+            size_dict = self.processor.size
+            if isinstance(size_dict, dict):
+                # Format: {"height": 224, "width": 224} or {"shortest_edge": 224}
+                return size_dict.get('height', size_dict.get('shortest_edge', 224))
+            elif isinstance(size_dict, int):
+                return size_dict
+        
+        # Fallback: parse from model name
+        if self.model_name:
+            if "256" in self.model_name:
+                return 256
+            elif "384" in self.model_name:
+                return 384
+            elif "224" in self.model_name:
+                return 224
+        
+        return 224  # Default
     
     def _load_model(self, model_name: str) -> None:
         """
@@ -173,6 +206,7 @@ class SigLIP2RoomClassifier:
         self,
         image: np.ndarray,
         return_dict: bool = False,
+        temperature: float = 1.0,
     ) -> np.ndarray:
         """
         Classify a single image into room type probabilities.
@@ -180,6 +214,7 @@ class SigLIP2RoomClassifier:
         Args:
             image: Input image as numpy array [H, W, C] in RGB format (0-255)
             return_dict: If True, return dict mapping room names to probabilities
+            temperature: Softmax temperature (default 1.0). Higher values (>1) soften the distribution.
             
         Returns:
             If return_dict=False: numpy array of shape (10,) with room probabilities
@@ -215,8 +250,9 @@ class SigLIP2RoomClassifier:
             logits = torch.matmul(image_embeddings, self.text_embeddings.T)
             
             # Apply temperature scaling and softmax for probability distribution
-            temperature = 1.0
-            probs = F.softmax(logits / temperature, dim=-1)
+            # Ensure temperature is positive
+            temp = max(1e-4, temperature)
+            probs = F.softmax(logits / temp, dim=-1)
             
             probs_np = probs.cpu().numpy().squeeze()
         
@@ -227,12 +263,14 @@ class SigLIP2RoomClassifier:
     def classify_batch(
         self,
         images: List[np.ndarray],
+        temperature: float = 1.0,
     ) -> np.ndarray:
         """
         Classify a batch of images into room type probabilities.
         
         Args:
             images: List of images as numpy arrays [H, W, C] in RGB format
+            temperature: Softmax temperature (default 1.0). Higher values (>1) soften the distribution.
             
         Returns:
             numpy array of shape (N, 10) with room probabilities for each image
@@ -271,8 +309,8 @@ class SigLIP2RoomClassifier:
             logits = torch.matmul(image_embeddings, self.text_embeddings.T)
             
             # Apply softmax for probabilities
-            temperature = 1.0
-            probs = F.softmax(logits / temperature, dim=-1)
+            temp = max(1e-4, temperature)
+            probs = F.softmax(logits / temp, dim=-1)
             
             return probs.cpu().numpy()
     

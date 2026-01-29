@@ -16,7 +16,20 @@ def monitor_results(results_path="results/", object_nav_path="datasets/objectnav
     
     # Create a map from episode index to episode object
     
-    state_dir = os.path.join(results_path, 'state')
+    # Dynamically find the state directory (e.g., state, state2)
+    # Prioritize "state" if it exists
+    if os.path.isdir(os.path.join(results_path, "state")):
+        state_dir_name = "state"
+    elif os.path.isdir(results_path):
+        state_dir_name = "state" # Default fallback
+        for d in os.listdir(results_path):
+            if d.startswith("state") and os.path.isdir(os.path.join(results_path, d)):
+                state_dir_name = d
+                break
+    else:
+        state_dir_name = "state"
+
+    state_dir = os.path.join(results_path, state_dir_name)
     if not os.path.isdir(state_dir):
         print(f"Error: {state_dir} is not a valid directory")
         return
@@ -171,6 +184,7 @@ import time
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Monitor evaluation results.")
     parser.add_argument("--minutes", type=float, default=None, help="Only include results modified in the last N minutes.")
+    parser.add_argument("--folder", type=str, default="results", help="Folder containing the results to monitor.")
     args = parser.parse_args()
     
-    monitor_results(minutes=args.minutes)
+    monitor_results(results_path=args.folder, minutes=args.minutes)

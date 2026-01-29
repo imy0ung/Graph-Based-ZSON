@@ -13,3 +13,5 @@ PlanningConf:
   max_detect_distance: 0.8 # [in navigator.py]
   obstcl_kernel_size: 0.5 # [in navigator.py]
   min_goal_dist: 0.7 # [in navigator.py]
+  min_siglip_score: 0.07 # [in navigator.py] Threshold for object verification
+  room_classification_temp: 1.0 # [in navigator.py] Temperature for room classification softmax (higher = softer)
