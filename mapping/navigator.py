@@ -167,6 +167,7 @@ class Navigator:
                 self.bayesian_scorer = BayesianFrontierScorer(
                     prior_matrix_path=prior_matrix_path,
                     lazy_load_siglip=True,  # Lazy load SigLIP2 model
+                    temperature=getattr(config.planner, 'room_classification_temp', 1.0),
                 )
                 print(f"[Navigator] Bayesian frontier scoring enabled with prior matrix: {prior_matrix_path}")
             except Exception as e:
@@ -240,6 +241,15 @@ class Navigator:
         self.max_detect_distance = int(config.planner.max_detect_distance / self.one_map.cell_size)
         self.obstcl_kernel_size = int(config.planner.obstcl_kernel_size / self.one_map.cell_size)
         self.min_goal_dist = int(config.planner.min_goal_dist / self.one_map.cell_size)
+        
+        # New configurable parameters for SigLIP2
+        self.min_siglip_score = getattr(config.planner, 'min_siglip_score', 0.05)
+        self.room_classification_temp = getattr(config.planner, 'room_classification_temp', 1.0)
+        
+        # Re-initialize Bayesian scorer with temperature if needed
+        if self.bayesian_scorer is not None:
+            self.bayesian_scorer.temperature = self.room_classification_temp
+            print(f"[Navigator] Updated Bayesian scorer temperature to {self.room_classification_temp}")
 
         self.path_id = 0
         self.filter_detections_depth = config.planner.filter_detections_depth
@@ -461,11 +471,15 @@ class Navigator:
         for target_obj, distance in candidates:
             # SigLIP2 검증 점수 확인 (오탐지 필터링)
             avg_clip = target_obj.avg_clip_score  # 변수명 호환성 유지 (실제로는 SigLIP2 점수)
-            if target_obj.clip_scores and avg_clip < min_clip_score:
+            
+            # Use configured threshold instead of hardcoded min_clip_score argument
+            threshold = self.min_siglip_score
+            
+            if target_obj.clip_scores and avg_clip < threshold:
                 # SigLIP2 점수가 너무 낮음 → 오탐지 가능성 높음
                 print(f"[SigLIP Filter] Rejected '{target_obj.label}' at "
                       f"({target_obj.position[0]:.2f}, {target_obj.position[1]:.2f}): "
-                      f"avg_siglip={avg_clip:.3f} < {min_clip_score} (obs={target_obj.num_observations})")
+                      f"avg_siglip={avg_clip:.3f} < {threshold} (obs={target_obj.num_observations})")
                 continue
             
             # 월드 좌표를 픽셀 좌표로 변환
@@ -1323,7 +1337,9 @@ class Navigator:
 
         # Single YOLO detection for both target object and pose graph registration
         # detect_all() returns all COCO classes with class_names
-        all_detections = self.detector.detect_all(rgb_image, confidence_threshold=0.8)
+        # Use configured confidence threshold
+        yolo_conf_threshold = self.config.planner.yolo_confidence
+        all_detections = self.detector.detect_all(rgb_image, confidence_threshold=yolo_conf_threshold)
         
         # Map COCO class names to standardized names using class_map
         # e.g., "tv_monitor" -> "tv", "couch" -> "couch"
@@ -1480,6 +1496,23 @@ class Navigator:
                             if self.pose_graph._step_counter % 100 == 0:
                                 print(f"[SigLIP Verify] Error for {class_name}: {e}")
                         
+                        # Debug logging for object registration decision
+                        decision = "ACCEPTED"
+                        reason = ""
+                        
+                        # Check YOLO confidence
+                        if score < yolo_conf_threshold:
+                            decision = "REJECTED"
+                            reason += f"YOLO({score:.2f})<{yolo_conf_threshold} "
+                            
+                        # Check SigLIP score if available
+                        if clip_score is not None:
+                            if clip_score < self.min_siglip_score:
+                                decision = "REJECTED"
+                                reason += f"SigLIP({clip_score:.3f})<{self.min_siglip_score}"
+                        
+                        print(f"[Object Registration] '{class_name}': YOLO={score:.2f}, SigLIP={clip_score if clip_score is not None else 'None'} -> {decision} {reason}")
+                        
                         observations.append({
                             "label": class_name,
                             "position_w": position_w,
@@ -1487,6 +1520,8 @@ class Navigator:
                             "embedding": None,
                             "clip_score": clip_score,  # SigLIP2 검증 점수 (변수명 호환성 유지)
                         })
+                    else:
+                        print(f"[Object Registration] '{class_name}': REJECTED (Invalid Position/Depth) - YOLO={score:.2f}")
                 
                 # Process all observations in batch
                 if observations:
@@ -1908,7 +1943,7 @@ class Navigator:
     def _extract_frontier_observation_image(
         self,
         frontier_world_pos: np.ndarray,
-        crop_size: int = 224,
+        crop_size: int = 256,  # Default to larger size; callers should use model's image_size
     ) -> Optional[np.ndarray]:
         """
         Extract a crop of the current camera image centered on the frontier's projected location.
@@ -1919,7 +1954,7 @@ class Navigator:
         
         Args:
             frontier_world_pos: Frontier position in world coordinates [x, y, z]
-            crop_size: Size of the output image (default 224 for SigLIP2)
+            crop_size: Size of the output image (default 256; callers should use model's image_size)
             
         Returns:
             RGB image crop [H, W, C] as numpy array, or None if projection fails
@@ -2006,6 +2041,9 @@ class Navigator:
         
         target_object = self.query_text[0] if self.query_text else "chair"
         
+        # Get expected image size from the SigLIP model
+        siglip_image_size = self.bayesian_scorer.siglip_classifier.image_size
+        
         # Prepare maps for path planning
         explored_mask = self.one_map.explored_area.astype(np.uint8)
         navigable_for_planning = self.one_map.navigable_map & explored_mask
@@ -2078,7 +2116,7 @@ class Navigator:
             # Extract frontier observation image for SigLIP2
             frontier_img = self._extract_frontier_observation_image(
                 frontier_node.position,
-                crop_size=224
+                crop_size=siglip_image_size
             )
             
             if frontier_img is None:
@@ -2086,7 +2124,7 @@ class Navigator:
                 if self.current_image is not None:
                     image_hwc = self.current_image.transpose(1, 2, 0)
                     pil_img = Image.fromarray(image_hwc.astype(np.uint8))
-                    pil_img = pil_img.resize((224, 224), Image.BILINEAR)
+                    pil_img = pil_img.resize((siglip_image_size, siglip_image_size), Image.BILINEAR)
                     frontier_img = np.array(pil_img)
                 else:
                     # Skip this frontier (remove from tracking lists)

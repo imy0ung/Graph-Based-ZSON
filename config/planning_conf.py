@@ -15,3 +15,5 @@ class PlanningConf:
     max_detect_distance: float
     obstcl_kernel_size: float
     min_goal_dist: float
+    min_siglip_score: float = 0.05
+    room_classification_temp: float = 1.0

@@ -53,7 +53,7 @@ class BayesianFrontierScorer:
     TARGET_OBJECTS = ["chair", "bed", "plant", "toilet", "sofa", "tv_monitor"]
     
     # Gateway strategy parameters
-    GATEWAY_ALPHA = 0.25  # Transition weight for hall_stairwell bonus
+    GATEWAY_ALPHA = 0.3  # Transition weight for hall_stairwell bonus
     HALL_STAIRWELL_IDX = ROOM_CATEGORIES.index("hall_stairwell")
     
     # Anti-oscillation parameters
@@ -67,6 +67,7 @@ class BayesianFrontierScorer:
         siglip_model_name: Optional[str] = None,  # Auto-detect best available model
         device: Optional[str] = None,
         lazy_load_siglip: bool = False,
+        temperature: float = 1.0,
     ):
         """
         Initialize Bayesian frontier scorer.
@@ -76,10 +77,12 @@ class BayesianFrontierScorer:
             siglip_model_name: HuggingFace model name for SigLIP (None for auto-detect)
             device: Device to run SigLIP on
             lazy_load_siglip: If True, defer SigLIP loading until first use
+            temperature: Softmax temperature for room classification
         """
         self.prior_matrix_path = prior_matrix_path
         self.siglip_model_name = siglip_model_name
         self.device = device
+        self.temperature = temperature
         
         # Load P(Object|Room) prior matrix from CSV
         self.prior_matrix = self._load_prior_matrix(prior_matrix_path)
@@ -90,7 +93,7 @@ class BayesianFrontierScorer:
             self._init_siglip()
         
         print(f"[BayesianScorer] Initialized with {len(self.TARGET_OBJECTS)} target objects "
-              f"and {len(ROOM_CATEGORIES)} room categories")
+              f"and {len(ROOM_CATEGORIES)} room categories (temp={self.temperature})")
     
     def _init_siglip(self) -> None:
         """Initialize SigLIP2 classifier (lazy loading)."""
@@ -217,7 +220,7 @@ class BayesianFrontierScorer:
         Returns:
             numpy array of shape (10,) with room probabilities
         """
-        return self.siglip_classifier.classify_image(frontier_image)
+        return self.siglip_classifier.classify_image(frontier_image, temperature=self.temperature)
     
     def compute_bayesian_score(
         self,
@@ -364,7 +367,7 @@ class BayesianFrontierScorer:
             path_distances_meters = [0.0] * len(frontier_images)
         
         # Batch classify room probabilities
-        all_room_probs = self.siglip_classifier.classify_batch(frontier_images)
+        all_room_probs = self.siglip_classifier.classify_batch(frontier_images, temperature=self.temperature)
         
         # Get object prior once
         object_prior = self.get_object_prior(target_object)
